@@ -121,12 +121,11 @@ providers.toml
 defaults.toml
 webui.toml
 agents/
-  victor.toml
-  writer.toml
+  example-agent.toml
 vaults/
   shared.toml
 identities/
-  victor/SOUL.md
+  example-agent/SOUL.md
 .env
 .companion/
   state.sqlite
@@ -139,10 +138,18 @@ The TOML files describe desired state: providers, defaults, agents, identities, 
 
 ## Workspace Files
 
+The repository root is not a live workspace. Keep real fleet configuration, provider orgs/tailnets, app names, identities, vault links, and `.env` files under `.local/` or outside the repository. Public examples should stay anonymized.
+
+Validate from a workspace:
+
+```bash
+companion validate --workspace .
+```
+
 `companion.toml` is the index:
 
 ```toml
-workspace = "tvc-companion"
+workspace = "example-companion"
 
 [backend.local]
 state = ".companion/state.sqlite"
@@ -159,12 +166,12 @@ vaults = "vaults/*.toml"
 
 ```toml
 [fly.default]
-org = "personal"
+org = "example-org"
 region = "cdg"
 token_env = "FLY_API_TOKEN"
 
-[tailscale.tvc]
-tailnet = "tail5f910b.ts.net"
+[tailscale.default]
+tailnet = "example.ts.net"
 api_key_env = "TAILSCALE_API_KEY"
 auth_key_secret = "TS_AUTHKEY"
 
@@ -177,19 +184,19 @@ One agent is one small file:
 
 ```toml
 [agent]
-id = "victor"
+id = "example-agent"
 runtime = "fly.default"
-network = "tailscale.tvc"
+network = "tailscale.default"
 model_provider = "openrouter.default"
 lifecycle = "present"
 protect = true
-fly_app = "tvc-companion-victor"
-tailscale_hostname = "victor"
-identity = "identities/victor/SOUL.md"
+fly_app = "example-companion-agent"
+tailscale_hostname = "example-agent"
+identity = "identities/example-agent/SOUL.md"
 
 [default_vault]
 enabled = true
-name = "Victor"
+name = "Example Agent"
 mcp_role = "write"
 ```
 
@@ -204,9 +211,9 @@ Ready-to-copy examples live in `examples/minimal` and `examples/webui`.
 | Validate local workspace files | `companion validate --workspace .` |
 | Validate provider access and OpenRouter models | `companion validate --providers --workspace .` |
 | Preview every resource | `companion plan --workspace .` |
-| Preview one agent or resource | `companion plan victor --workspace .` |
+| Preview one agent or resource | `companion plan example-agent --workspace .` |
 | Apply the current plan | `companion apply --workspace .` |
-| Apply one agent | `companion apply victor --workspace .` |
+| Apply one agent | `companion apply example-agent --workspace .` |
 | Print fleet outputs | `companion output --workspace .` |
 | Read one output | `companion output open_webui_url --raw --workspace .` |
 | Run the local dashboard | `companion serve --addr 127.0.0.1:8787 --workspace .` |
@@ -214,11 +221,11 @@ Ready-to-copy examples live in `examples/minimal` and `examples/webui`.
 Plan output is resource-oriented:
 
 ```text
-+ create fly_app.agent.writer tvc-companion-writer
-= no-op fly_volume.agent_data.victor vol_xxx
-~ update fly_secrets.agent.victor API_SERVER_KEY,OPENROUTER_API_KEY
-! drift tailscale_device.agent.writer missing writer
-- delete fly_app.agent.old tvc-companion-old
++ create fly_app.agent.example-agent example-companion-agent
+= no-op fly_volume.agent_data.example-agent vol_xxx
+~ update fly_secrets.agent.example-agent API_SERVER_KEY,OPENROUTER_API_KEY
+! drift tailscale_device.agent.example-agent missing example-agent
+- delete fly_app.agent.old example-companion-old
 ```
 
 Dashboard routes:
@@ -255,27 +262,27 @@ State is evidence, not desired config:
 
 ```bash
 companion state list --workspace .
-companion state show fly_app.agent.victor --workspace .
-companion state rm fly_app.agent.victor --workspace .
+companion state show fly_app.agent.example-agent --workspace .
+companion state rm fly_app.agent.example-agent --workspace .
 ```
 
 Import existing resources before managing them:
 
 ```bash
-companion import fly_app.agent.victor tvc-companion-victor --workspace .
-companion import fly_volume.agent_data.victor vol_xxx --attrs app=tvc-companion-victor --workspace .
+companion import fly_app.agent.example-agent example-companion-agent --workspace .
+companion import fly_volume.agent_data.example-agent vol_xxx --attrs app=example-companion-agent --workspace .
 ```
 
 Destroy is explicit:
 
 ```bash
-companion destroy fly_app.agent.victor --confirm victor --workspace .
+companion destroy fly_app.agent.example-agent --confirm example-agent --workspace .
 ```
 
 Persistent data requires backup intent:
 
 ```bash
-companion destroy fly_volume.agent_data.victor --confirm victor --destroy-data --backup-first --workspace .
+companion destroy fly_volume.agent_data.example-agent --confirm example-agent --destroy-data --backup-first --workspace .
 ```
 
 Missing desired resources become orphans until you import, remove state, set `lifecycle = "absent"`, or run an explicit destroy.
@@ -285,8 +292,8 @@ Missing desired resources become orphans until you import, remove state, set `li
 Hermes uses `SOUL.md` as the identity layer. Companion keeps the source file in the workspace and installs it during rollout.
 
 ```bash
-companion identity init victor --name Victor --workspace .
-companion identity render victor --workspace .
+companion identity init example-agent --name "Example Agent" --workspace .
+companion identity render example-agent --workspace .
 ```
 
 Every agent can have a default Granite vault:
@@ -294,7 +301,7 @@ Every agent can have a default Granite vault:
 ```toml
 [default_vault]
 enabled = true
-name = "Victor"
+name = "Example Agent"
 mcp_enabled = true
 mcp_role = "write"
 sync_serve = true
@@ -302,6 +309,16 @@ write_serve = true
 ```
 
 Agents can also connect to other Granite vaults with `vault_connections`. Use `mode = "write"` for HTTP MCP write access and `mode = "sync"` for Granite sync remotes.
+
+```toml
+[[vault_connections]]
+name = "shared-vault"
+mode = "sync"
+role = "write"
+host = "shared-vault"
+token_secret_name = "GRANITE_SHARED_VAULT_WRITE_TOKEN"
+mcp_name = "granite_shared_vault"
+```
 
 Deploy the shared Open WebUI through the same resource engine:
 
@@ -317,8 +334,8 @@ If an agent does not set `api_server.open_webui_url` or `api_server.open_webui_h
 go test ./...
 sh -n install.sh
 bash -n install.sh bin/start-on-fly bin/run-hermes-process bin/start-open-webui-on-fly
-go run ./cmd/companion validate --workspace .
-go run ./cmd/companion plan --workspace .
+go run ./cmd/companion validate --workspace examples/minimal
+go run ./cmd/companion plan --workspace examples/minimal
 ```
 
 Provider e2e tests use local `httptest.Server` mocks for Fly, Tailscale, and OpenRouter, plus a fake rollout runner. Do not hit live provider resources from tests unless a future live suite is explicitly gated.
