@@ -1,0 +1,27 @@
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+
+spotlight_testing = false
+
+[scripts]
+setup = "bash scripts/setup-conductor.sh"
+archive = "bash scripts/dev-conductor.sh archive"
+run_mode = "nonconcurrent"
+
+[scripts.run.dev]
+command = "COMPANION_COMPANIONS_ENABLED=true COMPANION_COMPANIONS_ALLOWED_EMAIL_DOMAINS=thevibecompany.co bash scripts/dev-conductor.sh"
+default = true
+icon = "play"
+
+[scripts.run."Dev (real Pi VM, slow)"]
+available_in = ["local"]
+command = "COMPANION_COMPANIONS_ENABLED=true COMPANION_COMPANIONS_ALLOWED_EMAIL_DOMAINS=thevibecompany.co COMPANION_DEV_BOX_MODE=lab bash scripts/dev-conductor.sh"
+icon = "box"
+
+[scripts.run.check]
+command = "pnpm verify:change"
+icon = "test-tube"
+
+[scripts.run."iOS (live Box)"]
+available_in = ["local"]
+command = "pnpm ios:live"
+icon = "smartphone"

@@ -1,0 +1,31 @@
+# Audited false positives already present on main before Gitleaks enforcement.
+# Keep these fingerprint-specific so new findings in the same files still fail CI.
+25bf7103b34a09e003eba641a886d80f59b94657:packages/companion-skill/skill/reference/api.md:generic-api-key:169
+25bf7103b34a09e003eba641a886d80f59b94657:packages/companion-skill/skill/scripts/test_secrets_runtime.py:generic-api-key:43
+25bf7103b34a09e003eba641a886d80f59b94657:packages/contracts/test/secrets.test.ts:generic-api-key:58
+25bf7103b34a09e003eba641a886d80f59b94657:packages/core/test/secretsCrypto.test.ts:generic-api-key:14
+4203f12bcacf654811c94ca319bbae501271486f:apps/api/src/skillListRoute.test.ts:generic-api-key:188
+9bbff31672ee93b60a6cb6cda7ff41c87ffd0f57:CLAUDE.md:generic-api-key:70
+
+# Audited RunSkill test fixtures from the feature branch. These are UUIDs, idempotency keys, and
+# literal redaction sentinels rather than live credentials.
+34b64f1d0facdf2efe764236795847000f3076bf:packages/contracts/test/modelProviders.test.ts:generic-api-key:18
+99a342e6b8e0bd76b2496fbd43549039424ff85d:apps/api/src/runRoutes.test.ts:generic-api-key:200
+99a342e6b8e0bd76b2496fbd43549039424ff85d:apps/api/src/runRoutes.test.ts:generic-api-key:230
+99a342e6b8e0bd76b2496fbd43549039424ff85d:apps/api/src/runRoutes.test.ts:generic-api-key:254
+99a342e6b8e0bd76b2496fbd43549039424ff85d:packages/core/test/runJobs.test.ts:generic-api-key:108
+834b27a52e30b35457a6b41b8c22779e63d58239:packages/contracts/test/modelProviders.test.ts:generic-api-key:9
+834b27a52e30b35457a6b41b8c22779e63d58239:packages/contracts/test/modelProviders.test.ts:generic-api-key:22
+834b27a52e30b35457a6b41b8c22779e63d58239:packages/contracts/test/skillRuns.test.ts:generic-api-key:18
+34b64f1d0facdf2efe764236795847000f3076bf:packages/contracts/test/vanishConnections.test.ts:generic-api-key:6
+34b64f1d0facdf2efe764236795847000f3076bf:packages/contracts/test/vanishConnections.test.ts:generic-api-key:16
+
+# Synthetic private-key fixture used to prove review-context redaction.
+dfae59e733906b13197c6563b3fb2d9813ab6f7d:.agents/skills/review-code-dev/scripts/test_collect_review_context.py:private-key:144
+
+# Audited Companion trigger test fixtures: the placeholder webhook secret 0123456789abcdef... used
+# to exercise the secret grammar and the timingSafeEqual route check. Never a live credential.
+a30e3cf92fcfbe99e33402deee30505dc2b3d3b7:apps/api/src/companionRoutes.test.ts:generic-api-key:22
+a30e3cf92fcfbe99e33402deee30505dc2b3d3b7:packages/contracts/test/companions.test.ts:generic-api-key:1027
+a30e3cf92fcfbe99e33402deee30505dc2b3d3b7:packages/contracts/test/companions.test.ts:generic-api-key:1048
+a30e3cf92fcfbe99e33402deee30505dc2b3d3b7:packages/contracts/test/companions.test.ts:generic-api-key:1079

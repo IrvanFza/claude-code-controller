@@ -1,0 +1,24 @@
+{
+  "name": "@companion/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./agent-operations": "./src/agentOperations.ts",
+    "./companion-runtime": "./src/companionRuntime.ts",
+    "./notifications": "./src/notifications.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "coverage": "vitest run --coverage --coverage.reporter=text-summary --coverage.reporter=json-summary"
+  },
+  "dependencies": {
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vitest": "3.2.7"
+  }
+}
