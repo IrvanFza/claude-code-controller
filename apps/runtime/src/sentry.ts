@@ -49,6 +49,12 @@ type RuntimeLogCapture = (
   expurgatedRecord: string,
 ) => void;
 
+type RuntimeLogBreadcrumb = (
+  level: "info" | "warning",
+  event: string,
+  expurgatedRecord: string,
+) => void;
+
 /**
  * Sentry is the alerting boundary; the JSON process log remains the complete diagnostic stream.
  * Keep one repeated error group visible without turning a tight runtime retry/takeover loop into an
@@ -73,16 +79,36 @@ function captureRuntimeLog(
   });
 }
 
-function captureRecord(capture: RuntimeLogCapture, level: "info" | "warn" | "error", record: RuntimeLogRecord): void {
+function captureRuntimeBreadcrumb(
+  level: "info" | "warning",
+  event: string,
+  expurgatedRecord: string,
+): void {
+  Sentry.addBreadcrumb({
+    category: "runtime",
+    level,
+    message: event,
+    data: { runtime_record: expurgatedRecord },
+  });
+}
+
+function captureRecord<TLevel extends string>(
+  capture: (level: TLevel, event: string, expurgatedRecord: string) => void,
+  level: TLevel,
+  record: RuntimeLogRecord,
+): void {
   const event = expurgateRuntimeMessage(record.event, "runtime.event");
   const expurgatedRecord = expurgateRuntimeMessage(JSON.stringify(record), "{}");
   capture(level, event, expurgatedRecord);
 }
 
-/** Mirror expurgated errors into Sentry, at most once per runtime event key per cooldown. */
+/**
+ * Rate-limit error events; retain operational warnings and failed timings as breadcrumbs.
+ */
 export function createSentryRuntimeProcessLog(
   log: RuntimeProcessLog,
   capture: RuntimeLogCapture = captureRuntimeLog,
+  breadcrumb: RuntimeLogBreadcrumb = captureRuntimeBreadcrumb,
   now: () => number = Date.now,
 ): RuntimeProcessLog {
   const lastCapturedAt = new Map<string, number>();
@@ -97,9 +123,11 @@ export function createSentryRuntimeProcessLog(
     },
     warn(record) {
       log.warn(record);
+      captureRecord(breadcrumb, "warning", record);
     },
     info(record) {
       log.info(record);
+      if (record.ok === false) captureRecord(breadcrumb, "warning", record);
     },
   };
 }

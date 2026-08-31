@@ -21,14 +21,15 @@ describe("runtime Sentry process log", () => {
     vi.clearAllMocks();
   });
 
-  it("keeps every JSON record but mirrors only errors", () => {
+  it("keeps the JSON sink, captures errors, and breadcrumbs operational warnings", () => {
     const base: RuntimeProcessLog = {
       error: vi.fn(),
       warn: vi.fn(),
       info: vi.fn(),
     };
     const capture = vi.fn();
-    const log = createSentryRuntimeProcessLog(base, capture);
+    const breadcrumb = vi.fn();
+    const log = createSentryRuntimeProcessLog(base, capture, breadcrumb);
     const warning = record("lease.renew.failed");
     const failure = record("runtime.claim_loop.error");
 
@@ -37,14 +38,16 @@ describe("runtime Sentry process log", () => {
 
     expect(base.warn).toHaveBeenCalledWith(warning);
     expect(base.error).toHaveBeenCalledWith(failure);
+    expect(breadcrumb).toHaveBeenCalledWith("warning", warning.event, JSON.stringify(warning));
     expect(capture).toHaveBeenCalledWith("error", failure.event, JSON.stringify(failure));
     expect(capture).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps failed provider timings in JSON without creating Sentry issues", () => {
+  it("keeps failed provider timings in JSON and the Sentry breadcrumb boundary", () => {
     const base: RuntimeProcessLog = { error() {}, warn() {}, info: vi.fn() };
     const capture = vi.fn();
-    const log = createSentryRuntimeProcessLog(base, capture);
+    const breadcrumb = vi.fn();
+    const log = createSentryRuntimeProcessLog(base, capture, breadcrumb);
     const timing = record("runtime.box.provider_call", { ok: false });
     const success = record("runtime.box.provider_call", { ok: true });
 
@@ -53,14 +56,17 @@ describe("runtime Sentry process log", () => {
 
     expect(base.info).toHaveBeenNthCalledWith(1, timing);
     expect(base.info).toHaveBeenNthCalledWith(2, success);
+    expect(breadcrumb).toHaveBeenCalledWith("warning", timing.event, JSON.stringify(timing));
+    expect(breadcrumb).toHaveBeenCalledTimes(1);
     expect(capture).not.toHaveBeenCalled();
   });
 
   it("rate-limits repeated errors by runtime event while preserving distinct groups", () => {
     const base: RuntimeProcessLog = { error: vi.fn(), warn() {}, info() {} };
     const capture = vi.fn();
+    const breadcrumb = vi.fn();
     let current = 1_000;
-    const log = createSentryRuntimeProcessLog(base, capture, () => current);
+    const log = createSentryRuntimeProcessLog(base, capture, breadcrumb, () => current);
     const fenceLost = record("runtime.work.fence_lost");
     const claimLoop = record("runtime.claim_loop.error");
 
