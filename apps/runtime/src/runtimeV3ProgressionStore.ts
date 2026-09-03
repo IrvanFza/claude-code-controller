@@ -39,6 +39,9 @@ interface ClaimRow {
   claimToken: string;
   claimEpoch: string;
   gateEpoch: string;
+  admissionStartedAt: Date | null;
+  inactivityDeadlineAt: Date | null;
+  absoluteDeadlineAt: Date | null;
 }
 
 interface TerminalCompletion {
@@ -53,12 +56,18 @@ function turnFromRow(row: {
   commandId: string;
   lane: "main" | "background";
   state: RuntimeV3Turn["state"];
+  admissionStartedAt: Date | null;
+  inactivityDeadlineAt: Date | null;
+  absoluteDeadlineAt: Date | null;
 }): RuntimeV3Turn {
   return {
     id: row.turnId,
     commandId: row.commandId,
     lane: row.lane,
     state: row.state,
+    admissionStartedAt: row.admissionStartedAt,
+    inactivityDeadlineAt: row.inactivityDeadlineAt,
+    absoluteDeadlineAt: row.absoluteDeadlineAt,
   };
 }
 
@@ -96,6 +105,12 @@ function createPostgresConvergence(
   options: { enabledLanes?: ReadonlySet<"main" | "background"> },
 ): RuntimeV3ConvergencePersistence {
   return {
+    async sweepLane({ lane, signal }) {
+      const rows = await abortable(sql<Array<{ swept: number }>>`
+        select public.companion_v3_runtime_sweep_deadlines(${lane}, 4) as swept
+      `, signal);
+      return rows[0]?.swept ?? 0;
+    },
     async claimLane({ executorId, lane, signal }) {
       if (options.enabledLanes && !options.enabledLanes.has(lane)) return null;
       const rows = warmOnly
@@ -103,15 +118,19 @@ function createPostgresConvergence(
           select org_id as "orgId", companion_id as "companionId", turn_id as "turnId",
             command_id as "commandId", lane::text, state::text,
             claim_token as "claimToken", claim_epoch::text as "claimEpoch",
-            gate_epoch::text as "gateEpoch"
-          from public.companion_v3_runtime_claim_warm(${executorId}, ${lane}, 30, 3)
+            gate_epoch::text as "gateEpoch", admission_started_at as "admissionStartedAt",
+            inactivity_deadline_at as "inactivityDeadlineAt",
+            absolute_deadline_at as "absoluteDeadlineAt"
+          from public.companion_v3_runtime_claim_warm_v4(${executorId}, ${lane}, 30, 4)
         `, signal)
         : await abortable(sql<ClaimRow[]>`
           select org_id as "orgId", companion_id as "companionId", turn_id as "turnId",
             command_id as "commandId", lane::text, state::text,
             claim_token as "claimToken", claim_epoch::text as "claimEpoch",
-            gate_epoch::text as "gateEpoch"
-          from public.companion_v3_runtime_claim(${executorId}, ${lane}, 30, 3)
+            gate_epoch::text as "gateEpoch", admission_started_at as "admissionStartedAt",
+            inactivity_deadline_at as "inactivityDeadlineAt",
+            absolute_deadline_at as "absoluteDeadlineAt"
+          from public.companion_v3_runtime_claim_v4(${executorId}, ${lane}, 30, 4)
         `, signal);
       const row = rows[0];
       return row
@@ -130,7 +149,7 @@ function createPostgresConvergence(
     async completeProgression(claim, outcome, signal) {
       const terminal = terminalInput(outcome);
       const rows = await abortable(sql<Array<{ completed: boolean }>>`
-        select public.companion_v3_runtime_complete(
+        select public.companion_v3_runtime_complete_v4(
           ${claim.orgId}::uuid,
           ${claim.companionId}::uuid,
           ${claim.turn.lane},
@@ -142,7 +161,7 @@ function createPostgresConvergence(
           ${terminal.code},
           ${terminal.message},
           ${terminal.action}::public.companion_runtime_error_action,
-          3
+          4
         ) as completed
       `, signal);
       return rows[0]?.completed === true;
@@ -169,6 +188,8 @@ interface PreparationClaimRow {
   claimEpoch: string;
   gateEpoch: string;
   createdAt: Date;
+  attemptCount: number;
+  deadlineAt: Date | null;
   authorized: boolean;
   actorId: string | null;
   modelId: string | null;
@@ -267,21 +288,28 @@ export function createRuntimeV3PostgresPreparationPersistence(
   sql: Sql,
 ): RuntimeV3PreparationPersistence {
   return {
-    async claim({ executorId }) {
-      const rows = await sql<PreparationClaimRow[]>`
+    async sweepDeadlines({ signal }) {
+      const rows = await abortable(sql<Array<{ swept: number }>>`
+        select public.companion_v3_runtime_sweep_preparation_deadlines(5) as swept
+      `, signal);
+      return rows[0]?.swept ?? 0;
+    },
+    async claim({ executorId, signal }) {
+      const rows = await abortable(sql<PreparationClaimRow[]>`
         select org_id as "orgId", companion_id as "companionId", turn_id as "turnId",
           command_id as "commandId", checkpoint, box_idempotency_key as "boxIdempotencyKey",
           box_id as "boxId", claim_token as "claimToken", claim_epoch::text as "claimEpoch",
           gate_epoch::text as "gateEpoch", created_at as "createdAt",
+          attempt_count as "attemptCount", deadline_at as "deadlineAt",
           authorized, actor_id as "actorId", model_id as "modelId", persona,
           settings_revision::text as "settingsRevision", skills_revision as "skillsRevision",
           provider_refs as "providerRefs", skill_refs as "skillRefs", mcp_refs as "mcpRefs",
           provider_material as "providerMaterial", skill_material as "skillMaterial",
           mcp_material as "mcpMaterial", config_catalog as "configCatalog"
-        from public.companion_v3_runtime_claim_preparation(
-          ${executorId}, ${PREPARATION_LEASE_SECONDS}, 4
+        from public.companion_v3_runtime_claim_preparation_v5(
+          ${executorId}, ${PREPARATION_LEASE_SECONDS}, 5
         )
-      `;
+      `, signal);
       const row = rows[0];
       const material = row ? decodeRuntimeV3PreparationSnapshot({
         provider_refs: row.providerRefs,
@@ -302,6 +330,8 @@ export function createRuntimeV3PostgresPreparationPersistence(
         boxIdempotencyKey: row.boxIdempotencyKey,
         boxId: row.boxId,
         createdAt: row.createdAt,
+        attemptCount: row.attemptCount,
+        deadlineAt: row.deadlineAt,
         authorized: row.authorized,
         actorId: row.actorId,
         modelId: row.modelId,
@@ -322,8 +352,8 @@ export function createRuntimeV3PostgresPreparationPersistence(
         },
       } : null;
     },
-    async checkpoint(claim, input) {
-      const rows = await sql<Array<{ checkpointed: boolean }>>`
+    async checkpoint(claim, input, signal) {
+      const rows = await abortable(sql<Array<{ checkpointed: boolean }>>`
         select public.companion_v3_runtime_checkpoint_preparation(
           ${claim.orgId}::uuid, ${claim.companionId}::uuid,
           ${claim.fence.token}::uuid, ${claim.fence.epoch.toString()}::bigint,
@@ -334,33 +364,33 @@ export function createRuntimeV3PostgresPreparationPersistence(
           ${input.appliedSkillsRevision ?? null}, ${input.skillsDigest ?? null},
           ${input.materialExpiresAt ?? null}, 4
         ) as checkpointed
-      `;
+      `, signal);
       return rows[0]?.checkpointed === true;
     },
-    async defer(claim, input) {
-      const rows = await sql<Array<{ deferred: boolean }>>`
+    async defer(claim, input, signal) {
+      const rows = await abortable(sql<Array<{ deferred: boolean }>>`
         select public.companion_v3_runtime_defer_preparation(
           ${claim.orgId}::uuid, ${claim.companionId}::uuid,
           ${claim.fence.token}::uuid, ${claim.fence.epoch.toString()}::bigint,
           ${claim.fence.gateEpoch.toString()}::bigint, ${input.delaySeconds},
           ${input.error?.code ?? null}, ${input.error?.message ?? null}, 4
         ) as deferred
-      `;
+      `, signal);
       return rows[0]?.deferred === true;
     },
-    async reauthorize(claim) {
-      const rows = await sql<Array<{ authorized: boolean }>>`
+    async reauthorize(claim, signal) {
+      const rows = await abortable(sql<Array<{ authorized: boolean }>>`
         select public.companion_v3_runtime_reauthorize_preparation(
           ${claim.orgId}::uuid, ${claim.companionId}::uuid,
           ${claim.fence.token}::uuid, ${claim.fence.epoch.toString()}::bigint,
           ${claim.fence.gateEpoch.toString()}::bigint, ${claim.executorId},
           ${PREPARATION_LEASE_SECONDS}, 4
         ) as authorized
-      `;
+      `, signal);
       return rows[0]?.authorized === true;
     },
-    async mintCredentials(claim) {
-      const rows = await sql<Array<{
+    async mintCredentials(claim, signal) {
+      const rows = await abortable(sql<Array<{
         hubToken: string;
         mcpBrokerToken: string | null;
         controlToken: string;
@@ -374,7 +404,7 @@ export function createRuntimeV3PostgresPreparationPersistence(
           ${claim.fence.gateEpoch.toString()}::bigint, ${claim.executorId},
           ${PREPARATION_LEASE_SECONDS}, 4
         )
-      `;
+      `, signal);
       return rows[0] ?? null;
     },
   };
@@ -410,6 +440,21 @@ export function createRuntimeV3PostgresWarmTurnPersistence(
         }
         : null;
     },
+    async beginAdmission(claim, signal) {
+      const rows = await abortable(sql<Array<{ begun: boolean }>>`
+        select public.companion_v3_runtime_begin_admission(
+          ${claim.orgId}::uuid,
+          ${claim.companionId}::uuid,
+          ${claim.turn.lane},
+          ${claim.turn.id}::uuid,
+          ${claim.fence.token}::uuid,
+          ${claim.fence.epoch.toString()}::bigint,
+          ${claim.fence.gateEpoch.toString()}::bigint,
+          4
+        ) as begun
+      `, signal);
+      return rows[0]?.begun === true;
+    },
     async recordAdmission(claim, input, signal) {
       const rows = await abortable(sql<Array<{ recorded: boolean }>>`
         select public.companion_v3_runtime_record_native_admission(
@@ -430,7 +475,7 @@ export function createRuntimeV3PostgresWarmTurnPersistence(
     },
     async project(claim, projection, signal) {
       const rows = await abortable(sql<Array<{ projected: string | null }>>`
-        select public.companion_v3_runtime_project_native_page(
+        select public.companion_v3_runtime_project_native_page_v4(
           ${claim.orgId}::uuid,
           ${claim.companionId}::uuid,
           ${claim.turn.lane},
@@ -441,8 +486,9 @@ export function createRuntimeV3PostgresWarmTurnPersistence(
           ${projection.throughCursor.toString()}::bigint,
           ${sql.json(projection.assistant)}::jsonb,
           ${projection.needsInput},
+          ${projection.activity},
           ${projection.processExited ? "process_exit" : projection.settled ? "settled" : null},
-          3
+          4
         ) as projected
       `, signal);
       const projected = rows[0]?.projected;

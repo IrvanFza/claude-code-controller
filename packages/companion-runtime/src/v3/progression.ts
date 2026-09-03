@@ -1,6 +1,6 @@
 import { safeRuntimeError } from "../errors";
 import { classifyPiJournalPage, type ValidatedPiJournalRead } from "../piEvents";
-import { COMPANION_BUDGETS } from "@companion/contracts";
+import { COMPANION_BUDGETS, COMPANION_RUNTIME_V3_BUDGETS } from "@companion/contracts";
 import type {
   ErrorAction,
   ProviderRef,
@@ -46,6 +46,9 @@ export interface RuntimeV3Turn {
   commandId: string;
   lane: RuntimeV3Lane;
   state: RuntimeV3TurnState;
+  admissionStartedAt?: Date | null;
+  inactivityDeadlineAt?: Date | null;
+  absoluteDeadlineAt?: Date | null;
 }
 
 export interface RuntimeV3Admission {
@@ -112,6 +115,10 @@ export interface RuntimeV3LifecycleIntentPersistence {
 }
 
 export interface RuntimeV3ConvergencePersistence {
+  sweepLane(input: {
+    lane: RuntimeV3Lane;
+    signal?: AbortSignal;
+  }): Promise<number>;
   claimLane(input: {
     executorId: string;
     lane: RuntimeV3Lane;
@@ -158,6 +165,8 @@ export interface RuntimeV3PreparationClaim {
   boxIdempotencyKey: string;
   boxId: string | null;
   createdAt: Date;
+  attemptCount?: number;
+  deadlineAt?: Date | null;
   authorized: boolean;
   actorId: string | null;
   modelId: string | null;
@@ -190,7 +199,11 @@ export interface RuntimeV3PreparedMaterial {
 }
 
 export interface RuntimeV3PreparationPersistence {
-  claim(input: { executorId: string }): Promise<RuntimeV3PreparationClaim | null>;
+  sweepDeadlines?(input: { signal?: AbortSignal }): Promise<number>;
+  claim(input: {
+    executorId: string;
+    signal?: AbortSignal;
+  }): Promise<RuntimeV3PreparationClaim | null>;
   checkpoint(
     claim: RuntimeV3PreparationClaim,
     input: {
@@ -203,14 +216,17 @@ export interface RuntimeV3PreparationPersistence {
       skillsDigest?: string;
       materialExpiresAt?: Date;
     },
+    signal?: AbortSignal,
   ): Promise<boolean>;
   defer(
     claim: RuntimeV3PreparationClaim,
     input: { delaySeconds: number; error: SafeRuntimeError | null },
+    signal?: AbortSignal,
   ): Promise<boolean>;
-  reauthorize(claim: RuntimeV3PreparationClaim): Promise<boolean>;
+  reauthorize(claim: RuntimeV3PreparationClaim, signal?: AbortSignal): Promise<boolean>;
   mintCredentials(
     claim: RuntimeV3PreparationClaim,
+    signal?: AbortSignal,
   ): Promise<RuntimeV3PreparationCredentials | null>;
 }
 
@@ -229,6 +245,7 @@ export interface RuntimeV3PreparationOptions {
   pi: Pick<RuntimePiControl, "startPiDaemon">;
   observePreparedLatency?: (durationMs: number) => void;
   now?: () => Date;
+  jitter?: () => number;
 }
 
 export type RuntimeV3LifecycleCheckpoint =
@@ -322,6 +339,7 @@ export interface RuntimeV3WarmTurnProjection {
   needsInput: boolean;
   settled: boolean;
   processExited: boolean;
+  activity: boolean;
 }
 
 export interface RuntimeV3WarmTurnPersistence {
@@ -329,6 +347,10 @@ export interface RuntimeV3WarmTurnPersistence {
     claim: RuntimeV3Claim,
     signal?: AbortSignal,
   ): Promise<RuntimeV3WarmTurnMaterial | null>;
+  beginAdmission(
+    claim: RuntimeV3Claim,
+    signal?: AbortSignal,
+  ): Promise<boolean>;
   recordAdmission(
     claim: RuntimeV3Claim,
     input: { invocationId: string; responseTurnId: string; cursor: bigint },
@@ -380,6 +402,36 @@ export interface RuntimeV3WarmTurnAdvanceOptions {
 
 const LANE_CONVERGENCE_LIMIT = 16;
 
+export interface RuntimeV3CommandWindow {
+  commandMs: number;
+  settlementMs: number;
+}
+
+export function runtimeV3CommandWindow(input: {
+  now: Date;
+  inactivityDeadlineAt: Date | null;
+  absoluteDeadlineAt: Date | null;
+}): RuntimeV3CommandWindow {
+  const silentDeadline = input.inactivityDeadlineAt
+    ? input.inactivityDeadlineAt.getTime() - COMPANION_RUNTIME_V3_BUDGETS.silentSettlementMs
+    : Number.POSITIVE_INFINITY;
+  const absoluteDeadline = input.absoluteDeadlineAt
+    ? input.absoluteDeadlineAt.getTime() - COMPANION_RUNTIME_V3_BUDGETS.heartbeatSettlementMs
+    : input.now.getTime() + COMPANION_RUNTIME_V3_BUDGETS.heartbeatCommandMs;
+  const silentWins = silentDeadline <= absoluteDeadline;
+  return {
+    commandMs: Math.max(1, (silentWins ? silentDeadline : absoluteDeadline) - input.now.getTime()),
+    settlementMs: silentWins
+      ? COMPANION_RUNTIME_V3_BUDGETS.silentSettlementMs
+      : COMPANION_RUNTIME_V3_BUDGETS.heartbeatSettlementMs,
+  };
+}
+
+function boundedSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
 function durableOutcome(outcome: RuntimeV3ProgressionOutcome): RuntimeV3DurableOutcome {
   if (outcome.kind !== "failed" && outcome.kind !== "interrupted") return outcome;
   return {
@@ -402,6 +454,10 @@ export function createRuntimeV3WarmTurnAdvance(
 ): RuntimeV3ConvergenceOptions["advance"] {
   return async (claim, signal) => {
     let projectionPendingAck: "none" | "nonterminal" | "terminal" = "none";
+    let admissionWriteIntent = false;
+    let inactivityDeadlineAt = claim.turn.inactivityDeadlineAt ?? null;
+    let absoluteDeadlineAt = claim.turn.absoluteDeadlineAt ?? null;
+    let durableNeedsInput = claim.turn.state === "needs_input";
     try {
       signal?.throwIfAborted();
       const material = signal
@@ -420,18 +476,49 @@ export function createRuntimeV3WarmTurnAdvance(
       let cursor = material.cursor;
       if (claim.turn.state === "succeeded" || claim.turn.state === "failed") {
         projectionPendingAck = "terminal";
-        await options.pi.acknowledge({ boxId: material.boxId, through: cursor, signal });
+        await options.pi.acknowledge({
+          boxId: material.boxId,
+          through: cursor,
+          signal: boundedSignal(signal, COMPANION_RUNTIME_V3_BUDGETS.heartbeatSettlementMs),
+        });
         projectionPendingAck = "none";
         return { kind: "ack_completed" };
       }
       if (claim.turn.state === "queued") {
+        if (claim.turn.admissionStartedAt) {
+          return {
+            kind: "interrupted",
+            code: "pi_admission_outcome_unknown",
+            message: "Pi admission may have occurred before executor takeover.",
+            action: "none",
+          };
+        }
+        const begun = signal
+          ? await options.persistence.beginAdmission(claim, signal)
+          : await options.persistence.beginAdmission(claim);
+        signal?.throwIfAborted();
+        if (!begun) {
+          return {
+            kind: "interrupted",
+            code: "pi_admission_fence_lost",
+            message: "Pi admission could not be fenced safely.",
+            action: "none",
+          };
+        }
+        admissionWriteIntent = true;
+        const admissionTimeout = AbortSignal.timeout(
+          COMPANION_RUNTIME_V3_BUDGETS.admissionAckMs,
+        );
+        const admissionSignal = signal
+          ? AbortSignal.any([signal, admissionTimeout])
+          : admissionTimeout;
         const admission = await options.pi.prompt({
           boxId: material.boxId,
           commandId: claim.turn.commandId,
           turnId: claim.turn.id,
           expectedInvocationId: material.piInvocationId,
           message: material.content,
-          signal,
+          signal: admissionSignal,
         });
         signal?.throwIfAborted();
         if (admission.outcome === "rejected") {
@@ -462,6 +549,13 @@ export function createRuntimeV3WarmTurnAdvance(
             action: "none",
           };
         }
+        admissionWriteIntent = false;
+        const admittedAt = Date.now();
+        absoluteDeadlineAt ??= new Date(admittedAt + COMPANION_BUDGETS.turnAbsoluteDeadlineMs);
+        inactivityDeadlineAt ??= new Date(Math.min(
+          admittedAt + COMPANION_BUDGETS.inactivityStallMs,
+          absoluteDeadlineAt.getTime(),
+        ));
         invocationId = admission.invocationId;
         cursor = admission.initialCursor;
         if (admission.responseAttemptId && admission.responseAttemptId !== claim.turn.id) {
@@ -482,18 +576,30 @@ export function createRuntimeV3WarmTurnAdvance(
 
       let assistantResults = 0;
       for (let pageNumber = 0; pageNumber < 32; pageNumber += 1) {
+        const commandWindow = runtimeV3CommandWindow({
+          now: new Date(),
+          inactivityDeadlineAt,
+          absoluteDeadlineAt,
+        });
+        const commandSignal = boundedSignal(signal, commandWindow.commandMs);
         const page = await options.pi.read({
           boxId: material.boxId,
           after: cursor,
           turnId: claim.turn.id,
           invocationId,
-          signal,
+          signal: commandSignal,
         });
         signal?.throwIfAborted();
         if (claim.turn.state === "needs_input" && page.events.length === 0 && !page.hasMore) {
           return { kind: "release" };
         }
         const classified = classifyPiJournalPage(page);
+        const projectedNeedsInput = classified.needsInput || (
+          durableNeedsInput
+          && !classified.activity
+          && !classified.settled
+          && classified.processExit === null
+        );
         const assistant = classified.projections.flatMap((projection) =>
           projection.type === "assistant"
             ? [{
@@ -513,13 +619,12 @@ export function createRuntimeV3WarmTurnAdvance(
         const projection = {
           throughCursor: classified.throughCursor,
           assistant,
-          needsInput: classified.needsInput,
+          needsInput: projectedNeedsInput,
           settled: classified.settled,
           processExited: classified.processExit !== null,
+          activity: classified.activity,
         };
-        const projected = signal
-          ? await options.persistence.project(claim, projection, signal)
-          : await options.persistence.project(claim, projection);
+        const projected = await options.persistence.project(claim, projection, commandSignal);
         if (projected) {
           projectionPendingAck = projected === "succeeded" || projected === "failed"
             ? "terminal"
@@ -537,11 +642,20 @@ export function createRuntimeV3WarmTurnAdvance(
         await options.pi.acknowledge({
           boxId: material.boxId,
           through: classified.throughCursor,
-          signal,
+          signal: boundedSignal(signal, commandWindow.settlementMs),
         });
         projectionPendingAck = "none";
         signal?.throwIfAborted();
         cursor = classified.throughCursor;
+        durableNeedsInput = projectedNeedsInput;
+        if (projectedNeedsInput) {
+          inactivityDeadlineAt = null;
+        } else if (classified.activity && absoluteDeadlineAt) {
+          inactivityDeadlineAt = new Date(Math.min(
+            Date.now() + COMPANION_BUDGETS.inactivityStallMs,
+            absoluteDeadlineAt.getTime(),
+          ));
+        }
         if (projected === "succeeded" || projected === "failed") {
           return { kind: "ack_completed" };
         }
@@ -553,7 +667,7 @@ export function createRuntimeV3WarmTurnAdvance(
             action: "none",
           };
         }
-        if (classified.needsInput) return { kind: "release" };
+        if (projectedNeedsInput) return { kind: "release" };
         if (classified.settled) {
           return assistantResults === 1
             ? { kind: "succeeded" }
@@ -572,6 +686,14 @@ export function createRuntimeV3WarmTurnAdvance(
         return { kind: "retry_ack" };
       }
       if (projectionPendingAck === "nonterminal") return { kind: "release" };
+      if (admissionWriteIntent) {
+        return {
+          kind: "interrupted",
+          code: "pi_admission_outcome_unknown",
+          message: "Pi admission could not be confirmed before executor handoff.",
+          action: "none",
+        };
+      }
       return {
         kind: "failed",
         code: "warm_turn_failed",
@@ -582,18 +704,37 @@ export function createRuntimeV3WarmTurnAdvance(
   };
 }
 
-const PREPARATION_RETRY_SECONDS = 5;
 const PREPARATION_POLL_SECONDS = 1;
 const PREPARATION_BOX_TTL_SECONDS = 6 * 60 * 60;
-export const RUNTIME_V3_PREPARATION_BUDGET_MS = COMPANION_BUDGETS.layoutInstallBudgetMs;
-export const RUNTIME_V3_STAGING_BUDGET_MS =
-  RUNTIME_V3_PREPARATION_BUDGET_MS - COMPANION_BUDGETS.boxRequestTimeoutMs;
-export const RUNTIME_V3_PI_ACTIVATION_BUDGET_MS = COMPANION_BUDGETS.boxRequestTimeoutMs;
+export const RUNTIME_V3_PREPARATION_BUDGET_MS =
+  COMPANION_RUNTIME_V3_BUDGETS.preparationDeadlineMs;
+export const RUNTIME_V3_STAGING_BUDGET_MS = COMPANION_RUNTIME_V3_BUDGETS.stagingMs;
+export const RUNTIME_V3_PI_ACTIVATION_BUDGET_MS =
+  COMPANION_RUNTIME_V3_BUDGETS.piActivationMs;
 
 if (
   RUNTIME_V3_STAGING_BUDGET_MS >= RUNTIME_V3_PREPARATION_BUDGET_MS
-  || RUNTIME_V3_PI_ACTIVATION_BUDGET_MS >= RUNTIME_V3_PREPARATION_BUDGET_MS
+  || RUNTIME_V3_PI_ACTIVATION_BUDGET_MS >= RUNTIME_V3_STAGING_BUDGET_MS
 ) throw new Error("Runtime v3 nested preparation budgets require a strict margin");
+
+export function runtimeV3PreparationRetryDelaySeconds(input: {
+  attemptCount: number;
+  jitter: number;
+  now: Date;
+  deadlineAt: Date | null;
+}): number {
+  const ladder = COMPANION_RUNTIME_V3_BUDGETS.preparationRetrySeconds;
+  const index = Math.min(Math.max(0, Math.trunc(input.attemptCount)), ladder.length - 1);
+  const base = ladder[index]!;
+  const sample = Math.min(1, Math.max(0, Number.isFinite(input.jitter) ? input.jitter : 0.5));
+  const jittered = Math.min(
+    ladder[ladder.length - 1]!,
+    Math.max(1, Math.round(base * (0.8 + sample * 0.4))),
+  );
+  if (!input.deadlineAt) return jittered;
+  const remaining = Math.floor((input.deadlineAt.getTime() - input.now.getTime()) / 1_000);
+  return Math.max(1, Math.min(jittered, remaining));
+}
 
 const LIFECYCLE_RETRY_SECONDS = 5;
 
@@ -775,19 +916,38 @@ export function createRuntimeV3Preparation(
   options: RuntimeV3PreparationOptions,
 ): RuntimeV3Convergence {
   const now = options.now ?? (() => new Date());
+  const jitter = options.jitter ?? Math.random;
   return {
-    async converge({ executorId }) {
+    async converge({ executorId, signal: shutdownSignal }) {
       let progressed = 0;
       while (progressed < LANE_CONVERGENCE_LIMIT) {
-        const claim = await options.persistence.claim({ executorId });
+        shutdownSignal?.throwIfAborted();
+        const expired = await options.persistence.sweepDeadlines?.({
+          signal: shutdownSignal,
+        }) ?? 0;
+        if (expired === 64) {
+          return { progressed: progressed + expired, exhausted: true };
+        }
+        progressed += expired;
+        const claim = await options.persistence.claim({ executorId, signal: shutdownSignal });
         if (!claim) return { progressed, exhausted: false };
-        const signal = AbortSignal.timeout(RUNTIME_V3_PREPARATION_BUDGET_MS);
+        const phaseStartedAt = now();
+        if (claim.deadlineAt && claim.deadlineAt.getTime() <= phaseStartedAt.getTime()) {
+          return { progressed, exhausted: false };
+        }
+        const remainingMs = claim.deadlineAt
+          ? claim.deadlineAt.getTime() - phaseStartedAt.getTime()
+          : RUNTIME_V3_PREPARATION_BUDGET_MS;
+        const deadlineSignal = boundedSignal(shutdownSignal, remainingMs);
+        const phaseSignal = (timeoutMs: number): AbortSignal =>
+          boundedSignal(deadlineSignal, timeoutMs);
         try {
           if (!claim.authorized) throw new Error("Runtime v3 preparation is not authorized");
           if (claim.checkpoint === "pending") {
-            if (!await options.persistence.reauthorize(claim)) {
+            if (!await options.persistence.reauthorize(claim, deadlineSignal)) {
               throw new Error("Runtime v3 preparation authorization changed");
             }
+            const providerSignal = phaseSignal(COMPANION_RUNTIME_V3_BUDGETS.providerRequestMs);
             const created = await options.box.createGenerationBox({
               companionId: claim.companionId,
               generation: 1n,
@@ -799,50 +959,62 @@ export function createRuntimeV3Preparation(
               // A preparation claim never waits for an image build. It may consume a ready image,
               // while the next fenced claim retries after the normal preparation backoff.
               deadlineAt: now(),
-              signal,
+              signal: providerSignal,
             });
+            providerSignal.throwIfAborted();
+            shutdownSignal?.throwIfAborted();
             if (!await options.persistence.checkpoint(claim, {
               next: "box_created",
               boxId: created.boxId,
-            })) return { progressed, exhausted: false };
+            }, deadlineSignal)) return { progressed, exhausted: false };
           } else if (claim.checkpoint === "box_created") {
             if (!claim.boxId) throw new Error("Box identity is missing after creation");
-            if (!await options.persistence.reauthorize(claim)) {
+            if (!await options.persistence.reauthorize(claim, deadlineSignal)) {
               throw new Error("Runtime v3 preparation authorization changed");
             }
+            const settingsSignal = phaseSignal(COMPANION_RUNTIME_V3_BUDGETS.providerRequestMs);
             await options.box.applyGenerationBoxSettings({
               boxId: claim.boxId,
               companionId: claim.companionId,
               generation: 1n,
               ttlSeconds: PREPARATION_BOX_TTL_SECONDS,
-              signal,
+              signal: settingsSignal,
             });
+            settingsSignal.throwIfAborted();
+            shutdownSignal?.throwIfAborted();
+            const statusSignal = phaseSignal(COMPANION_RUNTIME_V3_BUDGETS.providerRequestMs);
             const observed = await options.box.getStatus({
               boxId: claim.boxId,
               companionId: claim.companionId,
               generation: 1n,
-              signal,
+              signal: statusSignal,
             });
+            statusSignal.throwIfAborted();
+            shutdownSignal?.throwIfAborted();
             if (!["ready", "idle", "running"].includes(observed.state)) {
               await options.persistence.defer(claim, {
                 delaySeconds: PREPARATION_POLL_SECONDS,
                 error: null,
-              });
+              }, deadlineSignal);
               return { progressed: progressed + 1, exhausted: false };
             }
-            if (!await options.persistence.checkpoint(claim, { next: "box_ready" })) {
+            if (!await options.persistence.checkpoint(
+              claim, { next: "box_ready" }, deadlineSignal,
+            )) {
               return { progressed, exhausted: false };
             }
           } else if (claim.checkpoint === "box_ready") {
             if (!claim.boxId) throw new Error("Box identity is missing before staging");
+            const stagingSignal = phaseSignal(RUNTIME_V3_STAGING_BUDGET_MS);
             const staged = await options.preparationStager.stagePreparation({
               claim,
-              authorize: async () => await options.persistence.mintCredentials(claim),
-              signal: AbortSignal.any([
-                signal,
-                AbortSignal.timeout(RUNTIME_V3_STAGING_BUDGET_MS),
-              ]),
+              authorize: async () => await options.persistence.mintCredentials(
+                claim, stagingSignal,
+              ),
+              signal: stagingSignal,
             });
+            stagingSignal.throwIfAborted();
+            shutdownSignal?.throwIfAborted();
             if (!await options.persistence.checkpoint(claim, {
               next: "staged",
               diskLayoutVersion: staged.diskLayoutVersion,
@@ -850,39 +1022,45 @@ export function createRuntimeV3Preparation(
               appliedSkillsRevision: staged.appliedSkillsRevision,
               skillsDigest: staged.skillsDigest,
               materialExpiresAt: staged.materialExpiresAt,
-            })) {
+            }, deadlineSignal)) {
               return { progressed, exhausted: false };
             }
           } else {
             if (!claim.boxId) throw new Error("Box identity is missing before Pi activation");
-            if (!await options.persistence.reauthorize(claim)) {
+            if (!await options.persistence.reauthorize(claim, deadlineSignal)) {
               throw new Error("Runtime v3 preparation authorization changed");
             }
+            const activationSignal = phaseSignal(RUNTIME_V3_PI_ACTIVATION_BUDGET_MS);
             const pi = await options.pi.startPiDaemon({
               boxId: claim.boxId,
-              signal: AbortSignal.any([
-                signal,
-                AbortSignal.timeout(RUNTIME_V3_PI_ACTIVATION_BUDGET_MS),
-              ]),
+              signal: activationSignal,
             });
+            activationSignal.throwIfAborted();
+            shutdownSignal?.throwIfAborted();
             if (pi.state !== "idle") throw new Error("Pi did not become idle during preparation");
             if (!await options.persistence.checkpoint(claim, {
               next: "prepared",
               piInvocationId: pi.invocationId,
-            })) return { progressed, exhausted: false };
+            }, deadlineSignal)) return { progressed, exhausted: false };
             options.observePreparedLatency?.(Math.max(0, now().getTime() - claim.createdAt.getTime()));
           }
           progressed += 1;
         } catch (error) {
+          if (shutdownSignal?.aborted) return { progressed, exhausted: false };
           const safe = safeRuntimeError({
             code: "companion_prepare_failed",
             message: error,
             action: "retry",
           });
           await options.persistence.defer(claim, {
-            delaySeconds: PREPARATION_RETRY_SECONDS,
+            delaySeconds: runtimeV3PreparationRetryDelaySeconds({
+              attemptCount: claim.attemptCount ?? 0,
+              jitter: jitter(),
+              now: now(),
+              deadlineAt: claim.deadlineAt ?? null,
+            }),
             error: safe,
-          });
+          }, deadlineSignal);
           return { progressed: progressed + 1, exhausted: false };
         }
       }
@@ -959,6 +1137,30 @@ export function createRuntimeV3Convergence(
       return {
         progressed: lanes.reduce((count, lane) => count + lane.progressed, 0),
         exhausted: lanes.some((lane) => lane.exhausted),
+      };
+    },
+  };
+}
+
+/** Deadline enforcement runs on its own scheduler so blocked preparation cannot delay a Turn. */
+export function createRuntimeV3DeadlineSweep(
+  persistence: Pick<RuntimeV3ConvergencePersistence, "sweepLane">,
+): RuntimeV3Convergence {
+  return {
+    converge: async ({ signal }) => {
+      const swept = await Promise.all(RUNTIME_V3_LANES.map(async (lane) => {
+        let total = 0;
+        let batch = 0;
+        do {
+          signal?.throwIfAborted();
+          batch = await persistence.sweepLane({ lane, signal });
+          total += batch;
+        } while (batch === 64);
+        return total;
+      }));
+      return {
+        progressed: swept.reduce((count, value) => count + value, 0),
+        exhausted: false,
       };
     },
   };
