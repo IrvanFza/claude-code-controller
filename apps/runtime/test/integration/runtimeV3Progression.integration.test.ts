@@ -17,6 +17,7 @@ import {
   createRuntimeV3Lifecycle,
   createRuntimeV3Preparation,
   createRuntimeV3WarmTurnAdvance,
+  type RuntimeV3PreparationCredentials,
 } from "@companion/companion-runtime/v3/internal";
 import postgres from "postgres";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -92,7 +93,10 @@ async function createTestCompanion(companionId: string): Promise<void> {
     where id = ${companionId}::uuid`;
 }
 
-async function seedPreparedV3(piInvocationId: string): Promise<void> {
+async function seedPreparedV3(
+  piInvocationId: string,
+  companionId: string = ids.companion,
+): Promise<void> {
   await ownerSql`insert into public.companion_v3_instances(
     org_id, companion_id, desired_lifecycle_actor_id, box_id, pi_invocation_id,
     preparation_checkpoint, box_ready_at, staging_completed_at, prepared_at,
@@ -101,7 +105,7 @@ async function seedPreparedV3(piInvocationId: string): Promise<void> {
     preparation_mcp_refs, prepared_disk_layout_version, prepared_skills_digest,
     prepared_material_expires_at
   ) values (
-    ${ids.org}::uuid, ${ids.companion}::uuid, ${ids.owner}, 'bx_23456789', ${piInvocationId},
+    ${ids.org}::uuid, ${companionId}::uuid, ${ids.owner}, 'bx_23456789', ${piInvocationId},
     'prepared', current_timestamp, current_timestamp, current_timestamp,
     ${ids.owner}, 1, 1, 'claude-test', '[]'::jsonb, '[]'::jsonb, '[]'::jsonb,
     14, ${"a".repeat(64)}, current_timestamp + interval '6 hours'
@@ -231,7 +235,7 @@ describe("Runtime v3 progression facts", () => {
         select companion_id as "companionId", turn_id as "turnId", work_kind::text as "workKind",
           checkpoint, box_idempotency_key as "idempotencyKey", claim_token as token,
           claim_epoch::text as epoch, gate_epoch::text as gate
-        from public.companion_v3_runtime_claim_preparation_v5('runtime-cold', 30, 5)
+        from public.companion_v3_runtime_claim_preparation_v6('runtime-cold', 30, 6)
       `;
       expect(claims).toEqual([expect.objectContaining({
         companionId: coldCompanion,
@@ -242,26 +246,26 @@ describe("Runtime v3 progression facts", () => {
       })]);
 
       const first = claims[0]!;
-      await expect(runtimeSql`select public.companion_v3_runtime_checkpoint_preparation(
+      await expect(runtimeSql`select public.companion_v3_runtime_checkpoint_preparation_v6(
         ${ids.org}::uuid, ${coldCompanion}::uuid, ${first.token}::uuid,
         ${first.epoch}::bigint, ${first.gate}::bigint,
         'pending', 'box_created', 'bx_23456789', null,
-        null, null, null, null, null, 4
-      )`).resolves.toEqual([{ companion_v3_runtime_checkpoint_preparation: true }]);
+        null, null, null, null, null, 6
+      )`).resolves.toEqual([{ companion_v3_runtime_checkpoint_preparation_v6: true }]);
       const readyClaim = (await runtimeSql<Array<{
         token: string; epoch: string; gate: string;
       }>>`select claim_token as token, claim_epoch::text as epoch, gate_epoch::text as gate
-        from public.companion_v3_runtime_claim_preparation_v5('runtime-cold-retry', 30, 5)`)[0]!;
-      await expect(runtimeSql`select public.companion_v3_runtime_checkpoint_preparation(
+        from public.companion_v3_runtime_claim_preparation_v6('runtime-cold-retry', 30, 6)`)[0]!;
+      await expect(runtimeSql`select public.companion_v3_runtime_checkpoint_preparation_v6(
         ${ids.org}::uuid, ${coldCompanion}::uuid, ${readyClaim.token}::uuid,
         ${readyClaim.epoch}::bigint, ${readyClaim.gate}::bigint,
         'box_created', 'box_ready', null, null,
-        null, null, null, null, null, 4
-      )`).resolves.toEqual([{ companion_v3_runtime_checkpoint_preparation: true }]);
+        null, null, null, null, null, 6
+      )`).resolves.toEqual([{ companion_v3_runtime_checkpoint_preparation_v6: true }]);
       const retry = (await runtimeSql<Array<{
         token: string; epoch: string; gate: string;
       }>>`select claim_token as token, claim_epoch::text as epoch, gate_epoch::text as gate
-        from public.companion_v3_runtime_claim_preparation_v5('runtime-cold-defer', 30, 5)`)[0]!;
+        from public.companion_v3_runtime_claim_preparation_v6('runtime-cold-defer', 30, 6)`)[0]!;
       await expect(runtimeSql`select public.companion_v3_runtime_defer_preparation(
         ${ids.org}::uuid, ${coldCompanion}::uuid, ${retry.token}::uuid,
         ${retry.epoch}::bigint, ${retry.gate}::bigint, 5,
@@ -291,8 +295,8 @@ describe("Runtime v3 progression facts", () => {
       expect(queued[0]!.preparationDeadlineAt.getTime() - Date.now())
         .toBeGreaterThan(134 * 60_000);
       await expect(runtimeSql`
-        select * from public.companion_v3_runtime_claim_preparation_v5(
-          'runtime-cold-too-soon', 30, 5
+        select * from public.companion_v3_runtime_claim_preparation_v6(
+          'runtime-cold-too-soon', 30, 6
         )
       `).resolves.toEqual([]);
 
@@ -575,11 +579,11 @@ describe("Runtime v3 progression facts", () => {
         )`;
     });
     expect(lifecycle).toEqual([{ intent: "archive", revision: "2" }]);
-    await runtimeSql`select public.companion_v3_runtime_complete_v4(
+    await runtimeSql`select public.companion_v3_runtime_complete_v5(
       ${ids.org}::uuid, ${ids.companion}::uuid, 'main', ${mainClaim[0]!.turnId}::uuid,
       ${mainClaim[0]!.token}::uuid, ${mainClaim[0]!.epoch}::bigint,
       ${mainClaim[0]!.gate}::bigint,
-      'succeeded', null, null, null, 4
+      'succeeded', null, null, null, 5
     )`;
     const nextMain = await runtimeSql<Array<{ commandId: string }>>`
       select command_id as "commandId"
@@ -664,6 +668,9 @@ describe("Runtime v3 progression facts", () => {
     const claim = await convergence.claimLane({ executorId: "runtime-created-path", lane: "main" });
     expect(claim).not.toBeNull();
     const persistence = createRuntimeV3PostgresWarmTurnPersistence(runtimeSql);
+    await expect(persistence.beginAdmission(claim!, {
+      invocationId: "invocation-created", cursor: 0n,
+    })).resolves.toBe(true);
     await expect(persistence.recordAdmission(claim!, {
       invocationId: "invocation-created",
       responseTurnId: claim!.turn.id,
@@ -1652,7 +1659,7 @@ describe("Runtime v3 progression facts", () => {
     expect(assistant).toEqual([{ content: "one final response for the burst" }]);
   });
 
-  it("keeps a failed terminal ACK pending until takeover completes that ACK", async () => {
+  it("resumes a terminal projection committed before its transport response is lost", async () => {
     await seedPreparedV3("invocation-failed-terminal-ack");
     const messageId = randomUUID();
     let turnId = "";
@@ -1664,11 +1671,11 @@ describe("Runtime v3 progression facts", () => {
         )`;
       turnId = rows[0]!.turn.id;
     });
-    let rejectAck = true;
-    const prompt = vi.fn(async () => ({
+    let loseProjectionResponse = true;
+    const prompt = vi.fn(async (input: { turnId: string }) => ({
       outcome: "accepted" as const,
       invocationId: "invocation-failed-terminal-ack",
-      responseAttemptId: turnId,
+      responseAttemptId: input.turnId,
       initialCursor: 0n,
     }));
     const read = vi.fn(async (input: { turnId: string; invocationId: string }) => ({
@@ -1683,14 +1690,20 @@ describe("Runtime v3 progression facts", () => {
       acknowledgedCursor: 0n,
       hasMore: false,
     }));
-    const acknowledge = vi.fn(async (input: { through: bigint }) => {
-      if (rejectAck) throw new Error("terminal ACK transport lost");
-      return input.through;
-    });
+    const acknowledge = vi.fn(async (input: { through: bigint }) => input.through);
+    const baseWarmPersistence = createRuntimeV3PostgresWarmTurnPersistence(runtimeSql);
+    const warmPersistence = {
+      ...baseWarmPersistence,
+      project: vi.fn(async (...args: Parameters<typeof baseWarmPersistence.project>) => {
+        const result = await baseWarmPersistence.project(...args);
+        if (loseProjectionResponse) throw new Error("terminal projection response lost");
+        return result;
+      }),
+    };
     const convergence = createRuntimeV3Convergence({
       persistence: createRuntimeV3PostgresWarmConvergence(runtimeSql),
       advance: createRuntimeV3WarmTurnAdvance({
-        persistence: createRuntimeV3PostgresWarmTurnPersistence(runtimeSql),
+        persistence: warmPersistence,
         pi: { prompt, read, acknowledge },
       }),
     });
@@ -1705,19 +1718,36 @@ describe("Runtime v3 progression facts", () => {
       from public.companion_v3_turns where id = ${turnId}::uuid`;
     expect(pending).toEqual([{ state: "failed", terminalCursor: "1", ackPending: true }]);
 
-    rejectAck = false;
+    loseProjectionResponse = false;
     await expect(convergence.converge({ executorId: "runtime-failed-ack-takeover" }))
       .resolves.toEqual({ progressed: 1, exhausted: false });
     expect(prompt).toHaveBeenCalledOnce();
     expect(read).toHaveBeenCalledOnce();
-    expect(acknowledge).toHaveBeenCalledTimes(2);
+    expect(acknowledge).toHaveBeenCalledOnce();
     const completed = await ownerSql<Array<{ state: string; ackPending: boolean }>>`
       select state::text, journal_ack_pending as "ackPending"
       from public.companion_v3_turns where id = ${turnId}::uuid`;
     expect(completed).toEqual([{ state: "failed", ackPending: false }]);
+
+    const nextMessageId = randomUUID();
+    let nextTurnId = "";
+    await asApi(async (sql) => {
+      const rows = await sql<Array<{ turn: { id: string } }>>`
+        select turn from public.companion_v3_api_enqueue_warm_turn(
+          ${ids.org}::uuid, ${ids.companion}::uuid, ${nextMessageId}::uuid,
+          'progress after terminal projection takeover'
+        )`;
+      nextTurnId = rows[0]!.turn.id;
+    });
+    await expect(convergence.converge({ executorId: "runtime-after-terminal-takeover" }))
+      .resolves.toEqual({ progressed: 1, exhausted: false });
+    expect(prompt).toHaveBeenCalledTimes(2);
+    const [nextTurn] = await ownerSql<Array<{ state: string }>>`
+      select state::text from public.companion_v3_turns where id = ${nextTurnId}::uuid`;
+    expect(nextTurn).toEqual({ state: "failed" });
   });
 
-  it("reclaims a response root when a nonterminal page was durable before ACK loss", async () => {
+  it("resumes from a nonterminal projection committed before its response is lost", async () => {
     await seedPreparedV3("invocation-page-ack-loss");
     const messageId = randomUUID();
     let turnId = "";
@@ -1730,11 +1760,11 @@ describe("Runtime v3 progression facts", () => {
       turnId = rows[0]!.turn.id;
     });
     let readCount = 0;
-    let rejectAck = true;
-    const prompt = vi.fn(async () => ({
+    let loseProjectionResponse = true;
+    const prompt = vi.fn(async (input: { turnId: string }) => ({
       outcome: "accepted" as const,
       invocationId: "invocation-page-ack-loss",
-      responseAttemptId: turnId,
+      responseAttemptId: input.turnId,
       initialCursor: 0n,
     }));
     const read = vi.fn(async (input: { turnId: string; invocationId: string; after: bigint }) => {
@@ -1750,6 +1780,37 @@ describe("Runtime v3 progression facts", () => {
             event: { type: "tool_execution_end", toolCallId: "durable-tool", isError: false },
           }],
           nextCursor: 1n,
+          acknowledgedCursor: 0n,
+          hasMore: false,
+        };
+      }
+      if (input.turnId !== turnId) {
+        expect(input.after).toBe(0n);
+        return {
+          events: [
+            {
+              sequence: 1n,
+              invocationId: input.invocationId,
+              attemptId: input.turnId,
+              kind: "pi_event" as const,
+              event: {
+                type: "message_end",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "later work progressed" }],
+                  stopReason: "stop",
+                },
+              },
+            },
+            {
+              sequence: 2n,
+              invocationId: input.invocationId,
+              attemptId: input.turnId,
+              kind: "pi_event" as const,
+              event: { type: "agent_settled" },
+            },
+          ],
+          nextCursor: 2n,
           acknowledgedCursor: 0n,
           hasMore: false,
         };
@@ -1784,14 +1845,20 @@ describe("Runtime v3 progression facts", () => {
         hasMore: false,
       };
     });
-    const acknowledge = vi.fn(async (input: { through: bigint }) => {
-      if (rejectAck) throw new Error("nonterminal ACK transport lost");
-      return input.through;
-    });
+    const acknowledge = vi.fn(async (input: { through: bigint }) => input.through);
+    const baseWarmPersistence = createRuntimeV3PostgresWarmTurnPersistence(runtimeSql);
+    const warmPersistence = {
+      ...baseWarmPersistence,
+      project: vi.fn(async (...args: Parameters<typeof baseWarmPersistence.project>) => {
+        const result = await baseWarmPersistence.project(...args);
+        if (loseProjectionResponse) throw new Error("nonterminal projection response lost");
+        return result;
+      }),
+    };
     const convergence = createRuntimeV3Convergence({
       persistence: createRuntimeV3PostgresWarmConvergence(runtimeSql),
       advance: createRuntimeV3WarmTurnAdvance({
-        persistence: createRuntimeV3PostgresWarmTurnPersistence(runtimeSql),
+        persistence: warmPersistence,
         pi: { prompt, read, acknowledge },
       }),
     });
@@ -1803,14 +1870,32 @@ describe("Runtime v3 progression facts", () => {
       where id = ${turnId}::uuid`;
     expect(resumable).toEqual([{ state: "running", outcome: null }]);
 
-    rejectAck = false;
+    loseProjectionResponse = false;
     await expect(convergence.converge({ executorId: "runtime-page-ack-takeover" }))
       .resolves.toEqual({ progressed: 1, exhausted: false });
     expect(prompt).toHaveBeenCalledOnce();
     expect(read).toHaveBeenCalledTimes(2);
+    expect(acknowledge).toHaveBeenCalledOnce();
     const [completed] = await ownerSql<Array<{ state: string }>>`
       select state::text from public.companion_v3_turns where id = ${turnId}::uuid`;
     expect(completed).toEqual({ state: "succeeded" });
+
+    const nextMessageId = randomUUID();
+    let nextTurnId = "";
+    await asApi(async (sql) => {
+      const rows = await sql<Array<{ turn: { id: string } }>>`
+        select turn from public.companion_v3_api_enqueue_warm_turn(
+          ${ids.org}::uuid, ${ids.companion}::uuid, ${nextMessageId}::uuid,
+          'progress after nonterminal projection takeover'
+        )`;
+      nextTurnId = rows[0]!.turn.id;
+    });
+    await expect(convergence.converge({ executorId: "runtime-after-page-takeover" }))
+      .resolves.toEqual({ progressed: 1, exhausted: false });
+    expect(prompt).toHaveBeenCalledTimes(2);
+    const [nextTurn] = await ownerSql<Array<{ state: string }>>`
+      select state::text from public.companion_v3_turns where id = ${nextTurnId}::uuid`;
+    expect(nextTurn).toEqual({ state: "succeeded" });
   });
 
   it("increments lane fences monotonically and rejects stale completion", async () => {
@@ -1827,11 +1912,11 @@ describe("Runtime v3 progression facts", () => {
 
     expect(BigInt(second[0]!.epoch)).toBeGreaterThan(BigInt(first[0]!.epoch));
     const stale = await runtimeSql<Array<{ completed: boolean }>>`
-      select public.companion_v3_runtime_complete_v4(
+      select public.companion_v3_runtime_complete_v5(
         ${ids.org}::uuid, ${ids.companion}::uuid, 'main', ${first[0]!.turnId}::uuid,
         ${first[0]!.token}::uuid, ${first[0]!.epoch}::bigint,
         ${first[0]!.gate}::bigint,
-        'release', null, null, null, 4
+        'release', null, null, null, 5
       ) as completed`;
     expect(stale[0]!.completed).toBe(false);
   });
@@ -1843,11 +1928,11 @@ describe("Runtime v3 progression facts", () => {
         turn_id as "turnId"
       from public.companion_v3_runtime_claim_v4('runtime-null-outcome', 'main', 30, 4)`;
 
-    await expect(runtimeSql`select public.companion_v3_runtime_complete_v4(
+    await expect(runtimeSql`select public.companion_v3_runtime_complete_v5(
       ${ids.org}::uuid, ${ids.companion}::uuid, 'main', ${claim[0]!.turnId}::uuid,
       ${claim[0]!.token}::uuid, ${claim[0]!.epoch}::bigint,
       ${claim[0]!.gate}::bigint,
-      ${null}::text, null, null, null, 4
+      ${null}::text, null, null, null, 5
     )`).rejects.toThrow(/invalid Runtime v3 completion/);
 
     const facts = await ownerSql<Array<{ state: string; token: string | null }>>`
@@ -1910,10 +1995,10 @@ describe("Runtime v3 progression facts", () => {
       expect(BigInt(disabledGate)).toBeGreaterThan(BigInt(claim[0]!.gate));
 
       const completion = await runtimeSql<Array<{ completed: boolean }>>`
-        select public.companion_v3_runtime_complete_v4(
+        select public.companion_v3_runtime_complete_v5(
           ${ids.org}::uuid, ${ids.companion}::uuid, 'main', ${claim[0]!.turnId}::uuid,
           ${claim[0]!.token}::uuid, ${claim[0]!.epoch}::bigint,
-          ${claim[0]!.gate}::bigint, 'succeeded', null, null, null, 4
+          ${claim[0]!.gate}::bigint, 'succeeded', null, null, null, 5
         ) as completed`;
       expect(completion).toEqual([{ completed: false }]);
 
@@ -1997,7 +2082,39 @@ describe("Runtime v3 progression facts", () => {
   });
 
   it("fences a stale replica after admission takeover without dispatching the occurrence twice", async () => {
+    await ownerSql`insert into public.companion_runtime_instances(org_id, companion_id)
+      values (${ids.org}::uuid, ${ids.companion}::uuid) on conflict (companion_id) do nothing`;
     await seedPreparedV3("invocation-two-replicas");
+    const priorEventId = `durable-before-ambiguity:${randomUUID()}`;
+    await ownerSql`insert into public.companion_threads(org_id, companion_id)
+      values (${ids.org}::uuid, ${ids.companion}::uuid) on conflict (companion_id) do nothing`;
+    const [compatibilityBefore] = await ownerSql<Array<{ attempts: number; operations: number }>>`
+      select
+        (select count(*)::integer from public.companion_turn_attempts attempt
+          join public.companion_turns turn_row on turn_row.id = attempt.turn_id
+          where turn_row.org_id = ${ids.org}::uuid
+            and turn_row.companion_id = ${ids.companion}::uuid) as attempts,
+        (select count(*)::integer from public.companion_operations operation
+          where operation.org_id = ${ids.org}::uuid
+            and operation.companion_id = ${ids.companion}::uuid
+            and operation.kind = 'restart_pi' and operation.trigger = 'recovery') as operations`;
+    await ownerSql`
+      with advanced as (
+        update public.companion_threads set next_ordinal = next_ordinal + 1,
+          projection_sequence = projection_sequence + 1
+        where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid
+        returning next_ordinal - 1 as ordinal, projection_sequence
+      )
+      insert into public.companion_transcript_entries(
+        org_id, companion_id, event_id, ordinal, projection_sequence, role, content
+      ) select ${ids.org}::uuid, ${ids.companion}::uuid, ${priorEventId},
+        ordinal, projection_sequence, 'assistant', 'A complete durable fact.' from advanced`;
+    await ownerSql`insert into public.companion_main_pi_compactions(
+      org_id, companion_id, pi_invocation_id, generation, event_cursor, summary,
+      first_kept_entry_id, tokens_before, estimated_tokens_after, sha256, observed_at
+    ) values (${ids.org}::uuid, ${ids.companion}::uuid, 'invocation-two-replicas',
+      1, 1, 'Validated compacted summary.', ${priorEventId}, 100, 20,
+      encode(sha256(convert_to('Validated compacted summary.', 'UTF8')), 'hex'), clock_timestamp())`;
     const messageId = randomUUID();
     let turnId = "";
     await asApi(async (sql) => {
@@ -2014,20 +2131,56 @@ describe("Runtime v3 progression facts", () => {
       lane: "main",
     });
     expect(firstClaim).not.toBeNull();
-    await expect(firstStore.beginAdmission!(firstClaim!)).resolves.toBe(true);
+    await expect(firstStore.beginAdmission!(firstClaim!, {
+      invocationId: "invocation-two-replicas", cursor: 1n,
+    })).resolves.toBe(true);
     const prompt = vi.fn().mockResolvedValue({
       outcome: "accepted" as const,
       invocationId: "invocation-two-replicas",
       responseAttemptId: turnId,
-      initialCursor: 0n,
+      initialCursor: 1n,
     });
     await prompt();
+    await ownerSql`insert into public.companion_main_pi_compactions(
+      org_id, companion_id, pi_invocation_id, generation, event_cursor, summary,
+      first_kept_entry_id, tokens_before, estimated_tokens_after, sha256, observed_at
+    ) values (${ids.org}::uuid, ${ids.companion}::uuid, 'invocation-two-replicas',
+      2, 2, 'Unsafe post-write summary: dispatch exactly once', ${priorEventId}, 120, 20,
+      encode(sha256(convert_to('Unsafe post-write summary: dispatch exactly once', 'UTF8')), 'hex'),
+      clock_timestamp() + interval '1 millisecond')`;
+
+    const pendingBackgroundCommand = randomUUID();
+    await ownerSql`
+      with advanced as (
+        update public.companion_threads set next_ordinal = next_ordinal + 1,
+          projection_sequence = projection_sequence + 1
+        where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid
+        returning next_ordinal - 1 as ordinal, projection_sequence
+      )
+      insert into public.companion_transcript_entries(
+        org_id, companion_id, event_id, ordinal, projection_sequence, role, content
+      ) select ${ids.org}::uuid, ${ids.companion}::uuid,
+        ${`msg:${pendingBackgroundCommand}`}, ordinal, projection_sequence,
+        'user', 'another possible write' from advanced`;
+    await workerSql`select * from public.companion_v3_worker_admit_turn(
+      ${ids.org}::uuid, ${ids.companion}::uuid, ${pendingBackgroundCommand}::uuid,
+      ${`msg:${pendingBackgroundCommand}`}, ${ids.owner}
+    )`;
+    const pendingBackground = await createRuntimeV3PostgresWarmConvergence(runtimeSql).claimLane({
+      executorId: "runtime-pending-background", lane: "background",
+    });
+    expect(pendingBackground).not.toBeNull();
+    await expect(firstStore.beginAdmission(pendingBackground!, {
+      invocationId: "invocation-two-replicas", cursor: 1n,
+    })).resolves.toBe(true);
 
     await ownerSql`update public.companion_v3_lane_leases
       set renewed_at = clock_timestamp() - interval '2 seconds',
         expires_at = clock_timestamp() - interval '1 second'
       where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid
         and lane = 'main'`;
+    await ownerSql`delete from public.companion_provider_connections
+      where org_id = ${ids.org}::uuid and provider_id = 'anthropic'`;
     const secondStore = createRuntimeV3PostgresWarmTurnPersistence(runtimeSql);
     const secondReplica = createRuntimeV3Convergence({
       persistence: createRuntimeV3PostgresWarmConvergence(runtimeSql),
@@ -2039,15 +2192,1056 @@ describe("Runtime v3 progression facts", () => {
     await expect(secondReplica.converge({ executorId: "runtime-replica-b" }))
       .resolves.toEqual({ progressed: 1, exhausted: false });
     expect(prompt).toHaveBeenCalledOnce();
+    await ownerSql`insert into public.companion_provider_connections(
+      org_id, provider_id, auth_method, ciphertext, iv, auth_tag,
+      wrapped_dek, wrap_iv, wrap_auth_tag, key_id, connected_by
+    ) values (
+      ${ids.org}::uuid, 'anthropic', 'api_key', 'ciphertext', 'iv', 'tag',
+      'dek', 'wiv', 'wtag', 'key', ${ids.owner}
+    )`;
     await expect(firstStore.recordAdmission(firstClaim!, {
       invocationId: "invocation-two-replicas",
       responseTurnId: turnId,
-      cursor: 0n,
+      cursor: 1n,
     })).resolves.toBe(false);
-    const [settled] = await ownerSql<Array<{ state: string; code: string }>>`
-      select state::text, outcome_code as code from public.companion_v3_turns
-      where id = ${turnId}::uuid`;
-    expect(settled).toEqual({ state: "interrupted", code: "pi_admission_outcome_unknown" });
+    const [settled] = await ownerSql<Array<{
+      state: string; admission: string; code: string; action: string;
+      leaseToken: string | null; boxId: string; preparedAt: Date | null;
+      recycleCheckpoint: string; recoveryContext: string; noticePending: boolean;
+    }>>`
+      select turn_row.state::text, turn_row.admission_state::text as admission,
+        turn_row.outcome_code as code, turn_row.outcome_action::text as action,
+        lease.claim_token::text as "leaseToken", instance.box_id as "boxId",
+        instance.prepared_at as "preparedAt",
+        instance.pi_recycle_checkpoint as "recycleCheckpoint",
+        instance.recovery_context as "recoveryContext",
+        instance.context_loss_notice_pending as "noticePending"
+      from public.companion_v3_turns turn_row
+      join public.companion_v3_lane_leases lease using (org_id, companion_id, lane)
+      join public.companion_v3_instances instance using (org_id, companion_id)
+      where turn_row.id = ${turnId}::uuid`;
+    expect(settled).toMatchObject({
+      state: "interrupted", admission: "ambiguous", code: "pi_admission_ambiguous",
+      action: "none", leaseToken: null, boxId: "bx_23456789", preparedAt: null,
+      recycleCheckpoint: "terminate", noticePending: false,
+    });
+    expect(settled!.recoveryContext).toContain("Validated compacted summary.");
+    expect(settled!.recoveryContext).toContain("A complete durable fact.");
+    expect(settled!.recoveryContext).not.toContain("dispatch exactly once");
+    const [otherIntent] = await ownerSql<Array<{
+      state: string; admission: string; code: string; leaseToken: string | null;
+    }>>`
+      select turn_row.state::text, turn_row.admission_state::text as admission,
+        turn_row.outcome_code as code, lease.claim_token::text as "leaseToken"
+      from public.companion_v3_turns turn_row
+      join public.companion_v3_lane_leases lease using (org_id, companion_id, lane)
+      where turn_row.command_id = ${pendingBackgroundCommand}::uuid`;
+    expect(otherIntent).toEqual({
+      state: "interrupted", admission: "ambiguous",
+      code: "pi_admission_ambiguous", leaseToken: null,
+    });
+    await expect(asApi(async (sql) => {
+      await sql`select * from public.companion_api_retry_turn(
+        ${ids.org}::uuid, ${ids.companion}::uuid, ${turnId}::uuid,
+        ${randomUUID()}::uuid, 'web'
+      )`;
+    })).rejects.toThrow();
+    const [compatibility] = await ownerSql<Array<{ attempts: number; operations: number }>>`
+      select
+        (select count(*)::integer from public.companion_turn_attempts attempt
+          join public.companion_turns turn_row on turn_row.id = attempt.turn_id
+          where turn_row.org_id = ${ids.org}::uuid
+            and turn_row.companion_id = ${ids.companion}::uuid) as attempts,
+        (select count(*)::integer from public.companion_operations operation
+          where operation.org_id = ${ids.org}::uuid
+            and operation.companion_id = ${ids.companion}::uuid
+            and operation.kind = 'restart_pi' and operation.trigger = 'recovery') as operations`;
+    expect(compatibility).toEqual(compatibilityBefore);
+    await expect(createRuntimeV3PostgresWarmConvergence(runtimeSql).claimLane({
+      executorId: "runtime-before-self-heal", lane: "main",
+    })).resolves.toBeNull();
+
+    let terminationAttempts = 0;
+    const terminatePiInvocation = vi.fn(async () => {
+      const [clock] = await ownerSql<Array<{ deadlineAt: Date | null }>>`
+        select preparation_deadline_at as "deadlineAt"
+        from public.companion_v3_instances
+        where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid`;
+      expect(clock?.deadlineAt).toEqual(expect.any(Date));
+      expect(clock!.deadlineAt!.getTime()).toBeGreaterThan(Date.now());
+      terminationAttempts += 1;
+      return terminationAttempts === 1
+        ? { outcome: "superseded" as const }
+        : { outcome: "terminated" as const };
+    });
+    const piDaemonStatus = vi.fn().mockResolvedValue({
+      state: "idle" as const, invocationId: "invocation-superseding",
+    });
+    const resetPiSession = vi.fn().mockResolvedValue(undefined);
+    const stagePreparation = vi.fn(async (input: {
+      authorize: () => Promise<RuntimeV3PreparationCredentials | null>;
+    }) => {
+      expect(await input.authorize()).toBeTruthy();
+      return {
+        diskLayoutVersion: 14, appliedSettingsRevision: 1n, appliedSkillsRevision: 1,
+        skillsDigest: "c".repeat(64), materialExpiresAt: new Date(Date.now() + 6 * 60 * 60_000),
+      };
+    });
+    const preparationPersistence = createRuntimeV3PostgresPreparationPersistence(runtimeSql);
+    const deferPreparation = vi.fn(preparationPersistence.defer);
+    const selfHeal = createRuntimeV3Preparation({
+      persistence: { ...preparationPersistence, defer: deferPreparation },
+      box: { createGenerationBox: vi.fn(), applyGenerationBoxSettings: vi.fn(), getStatus: vi.fn() },
+      preparationStager: { stagePreparation },
+      pi: {
+        terminatePiInvocation, resetPiSession, piDaemonStatus,
+        startPiDaemon: vi.fn().mockResolvedValue({ state: "idle", invocationId: "invocation-healed" }),
+      },
+    });
+    const selfHealResult = await selfHeal.converge({ executorId: "runtime-self-heal" });
+    expect(deferPreparation).not.toHaveBeenCalled();
+    expect(selfHealResult).toEqual({ progressed: 4, exhausted: false });
+    expect(terminatePiInvocation).toHaveBeenCalledTimes(2);
+    expect(terminatePiInvocation).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      expectedInvocationId: "invocation-superseding",
+    }));
+    expect(piDaemonStatus).toHaveBeenCalledTimes(1);
+    expect(resetPiSession).toHaveBeenCalledTimes(1);
+    expect(stagePreparation).toHaveBeenCalledTimes(1);
+    const [healed] = await ownerSql<Array<{
+      boxId: string; piInvocationId: string; preparedAt: Date | null;
+      recycleCheckpoint: string | null;
+    }>>`select box_id as "boxId", pi_invocation_id as "piInvocationId",
+      prepared_at as "preparedAt", pi_recycle_checkpoint as "recycleCheckpoint"
+      from public.companion_v3_instances
+      where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid`;
+    expect(healed).toMatchObject({
+      boxId: "bx_23456789", piInvocationId: "invocation-healed",
+      preparedAt: expect.any(Date), recycleCheckpoint: null,
+    });
+
+    const nextMessage = randomUUID();
+    await asApi(async (sql) => {
+      await sql`select turn from public.companion_v3_api_enqueue_warm_turn(
+        ${ids.org}::uuid, ${ids.companion}::uuid, ${nextMessage}::uuid, 'continue safely'
+      )`;
+    });
+    let dispatched = "";
+    const nextTurn = createRuntimeV3Convergence({
+      persistence: createRuntimeV3PostgresWarmConvergence(runtimeSql),
+      advance: createRuntimeV3WarmTurnAdvance({
+        persistence: createRuntimeV3PostgresWarmTurnPersistence(runtimeSql),
+        pi: {
+          async prompt(input) {
+            dispatched = input.message;
+            return { outcome: "accepted", invocationId: "invocation-healed", initialCursor: 0n };
+          },
+          async read(input) {
+            return { events: [
+              { sequence: 1n, invocationId: input.invocationId, attemptId: input.turnId,
+                kind: "pi_event" as const, event: { type: "message_end", message: {
+                  role: "assistant", content: [{ type: "text", text: "Recovered answer." }],
+                  stopReason: "stop",
+                } } },
+              { sequence: 2n, invocationId: input.invocationId, attemptId: input.turnId,
+                kind: "pi_event" as const, event: { type: "agent_settled" } },
+            ], nextCursor: 2n, acknowledgedCursor: 0n, hasMore: false };
+          },
+          async acknowledge(input) { return input.through; },
+        },
+      }),
+    });
+    await expect(nextTurn.converge({ executorId: "runtime-after-self-heal" }))
+      .resolves.toEqual({ progressed: 1, exhausted: false });
+    expect(dispatched).toContain("Validated compacted summary.");
+    expect(dispatched).toContain("A complete durable fact.");
+    expect(dispatched).toContain("continue safely");
+    expect(dispatched).not.toContain("dispatch exactly once");
+    const replies = await ownerSql<Array<{ content: string }>>`
+      select content from public.companion_transcript_entries
+      where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid
+        and role = 'assistant' order by ordinal`;
+    expect(replies.at(-1)?.content).toBe("Recovered answer.");
+  });
+
+  it("abandons a terminal sibling ACK on the recycled invocation before later lanes progress", async () => {
+    const oldInvocation = "invocation-terminal-sibling";
+    await seedPreparedV3(oldInvocation);
+    await ownerSql`insert into public.companion_threads(org_id, companion_id)
+      values (${ids.org}::uuid, ${ids.companion}::uuid) on conflict (companion_id) do nothing`;
+    const oldBackgroundCommand = randomUUID();
+    await ownerSql`
+      with advanced as (
+        update public.companion_threads set next_ordinal = next_ordinal + 1,
+          projection_sequence = projection_sequence + 1
+        where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid
+        returning next_ordinal - 1 as ordinal, projection_sequence
+      )
+      insert into public.companion_transcript_entries(
+        org_id, companion_id, event_id, ordinal, projection_sequence, role, content
+      ) select ${ids.org}::uuid, ${ids.companion}::uuid, ${`msg:${oldBackgroundCommand}`},
+        ordinal, projection_sequence, 'user', 'background result before ambiguity' from advanced`;
+    const [oldBackgroundAdmission] = await workerSql<Array<{ turnId: string }>>`
+      select turn_id as "turnId" from public.companion_v3_worker_admit_turn(
+        ${ids.org}::uuid, ${ids.companion}::uuid, ${oldBackgroundCommand}::uuid,
+        ${`msg:${oldBackgroundCommand}`}, ${ids.owner}
+      )`;
+    const oldBackgroundTurnId = oldBackgroundAdmission!.turnId;
+    const convergence = createRuntimeV3PostgresWarmConvergence(runtimeSql);
+    const persistence = createRuntimeV3PostgresWarmTurnPersistence(runtimeSql);
+    const oldBackground = await convergence.claimLane({
+      executorId: "runtime-old-terminal-background", lane: "background",
+    });
+    expect(oldBackground?.turn.id).toBe(oldBackgroundTurnId);
+    const oldBackgroundMaterial = await persistence.authorize(oldBackground!);
+    expect(oldBackgroundMaterial).not.toBeNull();
+    await expect(persistence.beginAdmission(oldBackground!, {
+      invocationId: oldInvocation, cursor: oldBackgroundMaterial!.cursor,
+    })).resolves.toBe(true);
+    await expect(persistence.recordAdmission(oldBackground!, {
+      invocationId: oldInvocation, responseTurnId: oldBackgroundTurnId,
+      cursor: oldBackgroundMaterial!.cursor,
+    })).resolves.toBe(true);
+    await expect(persistence.project(oldBackground!, {
+      throughCursor: 1n,
+      assistant: [{
+        eventId: `v3:${oldBackgroundTurnId}:1`, content: "terminal background answer",
+      }],
+      needsInput: false, settled: true, processExited: false, activity: true,
+    })).resolves.toBe("succeeded");
+    const [terminalBeforeRecycle] = await ownerSql<Array<{
+      state: string; ackPending: boolean; leaseToken: string | null;
+    }>>`
+      select turn_row.state::text, turn_row.journal_ack_pending as "ackPending",
+        lease.claim_token::text as "leaseToken"
+      from public.companion_v3_turns turn_row
+      join public.companion_v3_lane_leases lease using (org_id, companion_id, lane)
+      where turn_row.id = ${oldBackgroundTurnId}::uuid`;
+    expect(terminalBeforeRecycle).toMatchObject({
+      state: "succeeded", ackPending: true, leaseToken: expect.any(String),
+    });
+
+    const ambiguousCommand = randomUUID();
+    let ambiguousTurnId = "";
+    await asApi(async (sql) => {
+      const rows = await sql<Array<{ turn: { id: string } }>>`
+        select turn from public.companion_v3_api_enqueue_warm_turn(
+          ${ids.org}::uuid, ${ids.companion}::uuid, ${ambiguousCommand}::uuid,
+          'main ambiguity after terminal background'
+        )`;
+      ambiguousTurnId = rows[0]!.turn.id;
+    });
+    const ambiguous = await convergence.claimLane({
+      executorId: "runtime-main-ambiguity-with-terminal-sibling", lane: "main",
+    });
+    expect(ambiguous?.turn.id).toBe(ambiguousTurnId);
+    const ambiguousMaterial = await persistence.authorize(ambiguous!);
+    expect(ambiguousMaterial).not.toBeNull();
+    await expect(persistence.beginAdmission(ambiguous!, {
+      invocationId: oldInvocation, cursor: ambiguousMaterial!.cursor,
+    })).resolves.toBe(true);
+    await expect(convergence.completeProgression(ambiguous!, {
+      kind: "interrupted",
+      error: {
+        code: "pi_admission_outcome_unknown",
+        message: "Pi may have acted on this message; it will not be sent again.",
+        action: "none",
+      },
+    })).resolves.toBe(true);
+    const [terminalAfterRecycle] = await ownerSql<Array<{
+      state: string; outcome: string; ackPending: boolean; leaseToken: string | null;
+    }>>`
+      select turn_row.state::text, turn_row.outcome::text,
+        turn_row.journal_ack_pending as "ackPending", lease.claim_token::text as "leaseToken"
+      from public.companion_v3_turns turn_row
+      join public.companion_v3_lane_leases lease using (org_id, companion_id, lane)
+      where turn_row.id = ${oldBackgroundTurnId}::uuid`;
+    expect(terminalAfterRecycle).toEqual({
+      state: "succeeded", outcome: "succeeded", ackPending: false, leaseToken: null,
+    });
+
+    await ownerSql`update public.companion_v3_instances set pi_recycle_checkpoint = null,
+      recycle_pi_invocation_id = null, recovery_turn_id = null
+      where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid`;
+    const newInvocation = "invocation-after-terminal-sibling";
+    await seedPreparedV3(newInvocation);
+    const acknowledge = vi.fn(async (input: { through: bigint }) => input.through);
+    const dispatched: string[] = [];
+    const pi = {
+      prompt: vi.fn(async (input: {
+        turnId: string; expectedInvocationId: string; message: string;
+      }) => {
+        dispatched.push(input.message);
+        return {
+          outcome: "accepted" as const, invocationId: input.expectedInvocationId,
+          responseAttemptId: input.turnId, initialCursor: 0n,
+        };
+      }),
+      read: vi.fn(async (input: { turnId: string; invocationId: string }) => ({
+        events: [
+          { sequence: 1n, invocationId: input.invocationId, attemptId: input.turnId,
+            kind: "pi_event" as const, event: { type: "message_end", message: {
+              role: "assistant", content: [{ type: "text", text: "new invocation answer" }],
+              stopReason: "stop",
+            } } },
+          { sequence: 2n, invocationId: input.invocationId, attemptId: input.turnId,
+            kind: "pi_event" as const, event: { type: "agent_settled" } },
+        ],
+        nextCursor: 2n, acknowledgedCursor: 0n, hasMore: false,
+      })),
+      acknowledge,
+    };
+    await expect(convergence.claimLane({
+      executorId: "runtime-no-old-terminal-ack", lane: "background",
+    })).resolves.toBeNull();
+    expect(acknowledge).not.toHaveBeenCalled();
+
+    const nextMainCommand = randomUUID();
+    let nextMainTurnId = "";
+    await asApi(async (sql) => {
+      const rows = await sql<Array<{ turn: { id: string } }>>`
+        select turn from public.companion_v3_api_enqueue_warm_turn(
+          ${ids.org}::uuid, ${ids.companion}::uuid, ${nextMainCommand}::uuid,
+          'new main after recycle'
+        )`;
+      nextMainTurnId = rows[0]!.turn.id;
+    });
+    const nextBackgroundCommand = randomUUID();
+    await ownerSql`
+      with advanced as (
+        update public.companion_threads set next_ordinal = next_ordinal + 1,
+          projection_sequence = projection_sequence + 1
+        where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid
+        returning next_ordinal - 1 as ordinal, projection_sequence
+      )
+      insert into public.companion_transcript_entries(
+        org_id, companion_id, event_id, ordinal, projection_sequence, role, content
+      ) select ${ids.org}::uuid, ${ids.companion}::uuid, ${`msg:${nextBackgroundCommand}`},
+        ordinal, projection_sequence, 'user', 'new background after recycle' from advanced`;
+    const [nextBackgroundAdmission] = await workerSql<Array<{ turnId: string }>>`
+      select turn_id as "turnId" from public.companion_v3_worker_admit_turn(
+        ${ids.org}::uuid, ${ids.companion}::uuid, ${nextBackgroundCommand}::uuid,
+        ${`msg:${nextBackgroundCommand}`}, ${ids.owner}
+      )`;
+    const nextBackgroundTurnId = nextBackgroundAdmission!.turnId;
+    for (const [lane, turnId] of [
+      ["main", nextMainTurnId], ["background", nextBackgroundTurnId],
+    ] as const) {
+      const claim = await convergence.claimLane({
+        executorId: `runtime-new-${lane}`, lane,
+      });
+      expect(claim?.turn.id).toBe(turnId);
+      const outcome = await createRuntimeV3WarmTurnAdvance({ persistence, pi })(claim!);
+      expect(outcome).toEqual({ kind: "ack_completed" });
+      await expect(convergence.completeProgression(claim!, { kind: "ack_completed" }))
+        .resolves.toBe(true);
+    }
+    expect(pi.prompt).toHaveBeenCalledTimes(2);
+    expect(acknowledge).toHaveBeenCalledTimes(2);
+    expect(dispatched.filter((message) =>
+      message.includes("[Recovered durable conversation context."))).toHaveLength(1);
+    const laterTurns = await ownerSql<Array<{ id: string; state: string }>>`
+      select id, state::text from public.companion_v3_turns
+      where id in (${nextMainTurnId}::uuid, ${nextBackgroundTurnId}::uuid)
+      order by id`;
+    expect(laterTurns).toEqual(expect.arrayContaining([
+      { id: nextMainTurnId, state: "succeeded" },
+      { id: nextBackgroundTurnId, state: "succeeded" },
+    ]));
+  });
+
+  it("releases a recovery-context reservation when preparation invalidates before write intent", async () => {
+    const recoveryContext = "Durable context reserved before invalidation.";
+    await seedPreparedV3("invocation-reservation-invalidation");
+    await ownerSql`update public.companion_v3_instances
+      set recovery_context = ${recoveryContext},
+        recovery_context_sha256 = encode(sha256(convert_to(${recoveryContext}, 'UTF8')), 'hex'),
+        recovery_context_turn_id = null
+      where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid`;
+    const firstCommand = randomUUID();
+    await asApi(async (sql) => {
+      await sql`select turn from public.companion_v3_api_enqueue_warm_turn(
+        ${ids.org}::uuid, ${ids.companion}::uuid, ${firstCommand}::uuid,
+        'reserve recovered context before invalidation'
+      )`;
+    });
+    const [first] = await runtimeSql<Array<{
+      turnId: string; token: string; epoch: string; gate: string;
+    }>>`
+      select turn_id as "turnId", claim_token as token, claim_epoch::text as epoch,
+        gate_epoch::text as gate
+      from public.companion_v3_runtime_claim_warm_v5(
+        'runtime-context-before-invalidation', 'main', 30, 5
+      )`;
+    expect(first).toBeDefined();
+    const [firstMaterial] = await runtimeSql<Array<{
+      invocationId: string; cursor: string; content: string; recoveryDeferred: boolean;
+    }>>`
+      select pi_invocation_id as "invocationId", activity_cursor::text as cursor,
+        content, recovery_deferred as "recoveryDeferred"
+      from public.companion_v3_runtime_authorize_warm_turn_v5(
+        ${ids.org}::uuid, ${ids.companion}::uuid, 'main', ${first!.turnId}::uuid,
+        ${first!.token}::uuid, ${first!.epoch}::bigint, ${first!.gate}::bigint, 5
+      )`;
+    expect(firstMaterial).toMatchObject({ recoveryDeferred: false });
+    expect(firstMaterial!.content).toContain(recoveryContext);
+    const [reserved] = await ownerSql<Array<{ reservedTurnId: string | null }>>`
+      select recovery_context_turn_id as "reservedTurnId"
+      from public.companion_v3_instances
+      where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid`;
+    expect(reserved?.reservedTurnId).toBe(first!.turnId);
+
+    await ownerSql`delete from public.companion_provider_connections
+      where org_id = ${ids.org}::uuid and provider_id = 'anthropic'`;
+    try {
+      const [invalidated] = await ownerSql<Array<{
+        context: string | null; reservedTurnId: string | null;
+      }>>`
+        select instance.recovery_context as context,
+          instance.recovery_context_turn_id as "reservedTurnId"
+        from public.companion_v3_instances instance
+        where instance.org_id = ${ids.org}::uuid
+          and instance.companion_id = ${ids.companion}::uuid`;
+      expect(invalidated).toEqual({ context: recoveryContext, reservedTurnId: null });
+      const [begun] = await runtimeSql<Array<{ begun: boolean }>>`
+        select public.companion_v3_runtime_begin_admission_v5(
+          ${ids.org}::uuid, ${ids.companion}::uuid, 'main', ${first!.turnId}::uuid,
+          ${first!.token}::uuid, ${first!.epoch}::bigint, ${first!.gate}::bigint,
+          ${firstMaterial!.invocationId}, ${firstMaterial!.cursor}::bigint, 5
+        ) as begun`;
+      expect(begun?.begun).toBe(false);
+      const [completed] = await runtimeSql<Array<{ completed: boolean }>>`
+        select public.companion_v3_runtime_complete_v5(
+          ${ids.org}::uuid, ${ids.companion}::uuid, 'main', ${first!.turnId}::uuid,
+          ${first!.token}::uuid, ${first!.epoch}::bigint, ${first!.gate}::bigint,
+          'release', null, null, null, 5
+        ) as completed`;
+      expect(completed?.completed).toBe(true);
+    } finally {
+      await ownerSql`insert into public.companion_provider_connections(
+        org_id, provider_id, auth_method, ciphertext, iv, auth_tag,
+        wrapped_dek, wrap_iv, wrap_auth_tag, key_id, connected_by
+      ) values (
+        ${ids.org}::uuid, 'anthropic', 'api_key', 'ciphertext', 'iv', 'tag',
+        'dek', 'wiv', 'wtag', 'key', ${ids.owner}
+      ) on conflict (org_id, provider_id) do nothing`;
+    }
+
+    await seedPreparedV3("invocation-reservation-restaged");
+    const [next] = await runtimeSql<Array<{
+      turnId: string; token: string; epoch: string; gate: string;
+    }>>`
+      select turn_id as "turnId", claim_token as token, claim_epoch::text as epoch,
+        gate_epoch::text as gate
+      from public.companion_v3_runtime_claim_warm_v5(
+        'runtime-context-after-invalidation', 'main', 30, 5
+      )`;
+    expect(next).toBeDefined();
+    expect(next!.turnId).toBe(first!.turnId);
+    const [nextMaterial] = await runtimeSql<Array<{
+      content: string; recoveryDeferred: boolean;
+    }>>`
+      select content, recovery_deferred as "recoveryDeferred"
+      from public.companion_v3_runtime_authorize_warm_turn_v5(
+        ${ids.org}::uuid, ${ids.companion}::uuid, 'main', ${next!.turnId}::uuid,
+        ${next!.token}::uuid, ${next!.epoch}::bigint, ${next!.gate}::bigint, 5
+      )`;
+    expect(nextMaterial).toMatchObject({ recoveryDeferred: false });
+    expect(nextMaterial!.content).toContain(recoveryContext);
+  });
+
+  it("hands off committed authorization and begin writes before Pi, then resumes the same Turn", async () => {
+    const recoveryContext = "Durable context survives pre-Pi transport loss.";
+    await seedPreparedV3("invocation-pre-pi-handoff");
+    await ownerSql`update public.companion_v3_instances
+      set recovery_context = ${recoveryContext},
+        recovery_context_sha256 = encode(sha256(convert_to(${recoveryContext}, 'UTF8')), 'hex'),
+        recovery_context_turn_id = null
+      where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid`;
+    const commandId = randomUUID();
+    let turnId = "";
+    await asApi(async (sql) => {
+      const rows = await sql<Array<{ turn: { id: string } }>>`
+        select turn from public.companion_v3_api_enqueue_warm_turn(
+          ${ids.org}::uuid, ${ids.companion}::uuid, ${commandId}::uuid,
+          'resume after pre-Pi writes'
+        )`;
+      turnId = rows[0]!.turn.id;
+    });
+    const convergence = createRuntimeV3PostgresWarmConvergence(runtimeSql);
+    const basePersistence = createRuntimeV3PostgresWarmTurnPersistence(runtimeSql);
+    const prompt = vi.fn(async (input: { turnId: string; expectedInvocationId: string }) => ({
+      outcome: "accepted" as const,
+      invocationId: input.expectedInvocationId,
+      responseAttemptId: input.turnId,
+      initialCursor: 0n,
+    }));
+    const pi = {
+      prompt,
+      read: vi.fn(async (input: { turnId: string; invocationId: string }) => ({
+        events: [
+          {
+            sequence: 1n,
+            invocationId: input.invocationId,
+            attemptId: input.turnId,
+            kind: "pi_event" as const,
+            event: {
+              type: "message_end",
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "resumed after pre-Pi handoff" }],
+                stopReason: "stop",
+              },
+            },
+          },
+          {
+            sequence: 2n,
+            invocationId: input.invocationId,
+            attemptId: input.turnId,
+            kind: "pi_event" as const,
+            event: { type: "agent_settled" },
+          },
+        ],
+        nextCursor: 2n,
+        acknowledgedCursor: 0n,
+        hasMore: false,
+      })),
+      acknowledge: vi.fn(async (input: { through: bigint }) => input.through),
+    };
+
+    const authorizationClaim = await convergence.claimLane({
+      executorId: "runtime-authorize-response-lost", lane: "main",
+    });
+    expect(authorizationClaim).not.toBeNull();
+    const authorizeThenLose = {
+      ...basePersistence,
+      authorize: vi.fn(async (...args: Parameters<typeof basePersistence.authorize>) => {
+        const material = await basePersistence.authorize(...args);
+        expect(material?.content).toContain(recoveryContext);
+        throw new Error("authorization response lost after reservation commit");
+      }),
+    };
+    const authorizationOutcome = await createRuntimeV3WarmTurnAdvance({
+      persistence: authorizeThenLose, pi,
+    })(authorizationClaim!);
+    expect(authorizationOutcome).toEqual({ kind: "release" });
+    expect(prompt).not.toHaveBeenCalled();
+    await expect(convergence.completeProgression(authorizationClaim!, { kind: "release" }))
+      .resolves.toBe(true);
+    const [afterAuthorizationLoss] = await ownerSql<Array<{
+      state: string; admissionStartedAt: Date | null; reservedTurnId: string | null;
+    }>>`
+      select turn_row.state::text, turn_row.admission_started_at as "admissionStartedAt",
+        instance.recovery_context_turn_id as "reservedTurnId"
+      from public.companion_v3_turns turn_row
+      join public.companion_v3_instances instance using (org_id, companion_id)
+      where turn_row.id = ${turnId}::uuid`;
+    expect(afterAuthorizationLoss).toEqual({
+      state: "queued", admissionStartedAt: null, reservedTurnId: null,
+    });
+
+    const beginClaim = await convergence.claimLane({
+      executorId: "runtime-begin-response-lost", lane: "main",
+    });
+    expect(beginClaim?.turn.id).toBe(turnId);
+    const controller = new AbortController();
+    const beginThenAbort = {
+      ...basePersistence,
+      beginAdmission: vi.fn(async (...args: Parameters<typeof basePersistence.beginAdmission>) => {
+        const begun = await basePersistence.beginAdmission(...args);
+        controller.abort();
+        return begun;
+      }),
+    };
+    const beginOutcome = await createRuntimeV3WarmTurnAdvance({
+      persistence: beginThenAbort, pi,
+    })(beginClaim!, controller.signal);
+    expect(beginOutcome).toEqual({ kind: "release" });
+    expect(prompt).not.toHaveBeenCalled();
+    await expect(convergence.completeProgression(beginClaim!, { kind: "release" }))
+      .resolves.toBe(true);
+    const [afterBeginLoss] = await ownerSql<Array<{
+      state: string; admissionStartedAt: Date | null; reservedTurnId: string | null;
+    }>>`
+      select turn_row.state::text, turn_row.admission_started_at as "admissionStartedAt",
+        instance.recovery_context_turn_id as "reservedTurnId"
+      from public.companion_v3_turns turn_row
+      join public.companion_v3_instances instance using (org_id, companion_id)
+      where turn_row.id = ${turnId}::uuid`;
+    expect(afterBeginLoss).toEqual({
+      state: "queued", admissionStartedAt: null, reservedTurnId: null,
+    });
+
+    const resumedClaim = await convergence.claimLane({
+      executorId: "runtime-pre-pi-resumed", lane: "main",
+    });
+    expect(resumedClaim?.turn.id).toBe(turnId);
+    const resumedOutcome = await createRuntimeV3WarmTurnAdvance({
+      persistence: basePersistence, pi,
+    })(resumedClaim!);
+    expect(resumedOutcome).toEqual({ kind: "ack_completed" });
+    await expect(convergence.completeProgression(resumedClaim!, { kind: "ack_completed" }))
+      .resolves.toBe(true);
+    expect(prompt).toHaveBeenCalledOnce();
+    const [completed] = await ownerSql<Array<{ state: string; reservedTurnId: string | null }>>`
+      select turn_row.state::text, instance.recovery_context_turn_id as "reservedTurnId"
+      from public.companion_v3_turns turn_row
+      join public.companion_v3_instances instance using (org_id, companion_id)
+      where turn_row.id = ${turnId}::uuid`;
+    expect(completed).toEqual({ state: "succeeded", reservedTurnId: null });
+  });
+
+  it("hands off after durable admission commits, then takeover settles without redispatch", async () => {
+    await seedPreparedV3("invocation-admission-ack-handoff");
+    const commandId = randomUUID();
+    let turnId = "";
+    await asApi(async (sql) => {
+      const rows = await sql<Array<{ turn: { id: string } }>>`
+        select turn from public.companion_v3_api_enqueue_warm_turn(
+          ${ids.org}::uuid, ${ids.companion}::uuid, ${commandId}::uuid,
+          'resume after admission acknowledgement'
+        )`;
+      turnId = rows[0]!.turn.id;
+    });
+    const convergence = createRuntimeV3PostgresWarmConvergence(runtimeSql);
+    const basePersistence = createRuntimeV3PostgresWarmTurnPersistence(runtimeSql);
+    const prompt = vi.fn(async (input: { turnId: string; expectedInvocationId: string }) => ({
+      outcome: "accepted" as const,
+      invocationId: input.expectedInvocationId,
+      responseAttemptId: input.turnId,
+      initialCursor: 0n,
+    }));
+    const read = vi.fn(async (input: { turnId: string; invocationId: string }) => ({
+      events: [
+        {
+          sequence: 1n,
+          invocationId: input.invocationId,
+          attemptId: input.turnId,
+          kind: "pi_event" as const,
+          event: {
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "settled by takeover" }],
+              stopReason: "stop",
+            },
+          },
+        },
+        {
+          sequence: 2n,
+          invocationId: input.invocationId,
+          attemptId: input.turnId,
+          kind: "pi_event" as const,
+          event: { type: "agent_settled" },
+        },
+      ],
+      nextCursor: 2n,
+      acknowledgedCursor: 0n,
+      hasMore: false,
+    }));
+    const pi = {
+      prompt,
+      read,
+      acknowledge: vi.fn(async (input: { through: bigint }) => input.through),
+    };
+    const firstClaim = await convergence.claimLane({
+      executorId: "runtime-admission-ack-lost", lane: "main",
+    });
+    expect(firstClaim).not.toBeNull();
+    const recordThenLoseResponse = {
+      ...basePersistence,
+      recordAdmission: vi.fn(async (...args: Parameters<typeof basePersistence.recordAdmission>) => {
+        expect(await basePersistence.recordAdmission(...args)).toBe(true);
+        throw new Error("admission ledger response lost after commit");
+      }),
+    };
+    const firstOutcome = await createRuntimeV3WarmTurnAdvance({
+      persistence: recordThenLoseResponse, pi,
+    })(firstClaim!);
+    expect(firstOutcome).toMatchObject({
+      kind: "interrupted", code: "pi_admission_outcome_unknown",
+    });
+    expect(prompt).toHaveBeenCalledOnce();
+    expect(read).not.toHaveBeenCalled();
+    await expect(convergence.completeProgression(firstClaim!, {
+      kind: "interrupted",
+      error: {
+        code: "pi_admission_outcome_unknown",
+        message: "Pi may have acted on this message; it will not be sent again.",
+        action: "none",
+      },
+    }))
+      .resolves.toBe(true);
+    const [admitted] = await ownerSql<Array<{ state: string; admission: string }>>`
+      select state::text, admission_state::text as admission
+      from public.companion_v3_turns where id = ${turnId}::uuid`;
+    expect(admitted).toEqual({ state: "admitted", admission: "accepted" });
+
+    const takeoverClaim = await convergence.claimLane({
+      executorId: "runtime-admission-ack-takeover", lane: "main",
+    });
+    expect(takeoverClaim?.turn.id).toBe(turnId);
+    const takeoverOutcome = await createRuntimeV3WarmTurnAdvance({
+      persistence: basePersistence, pi,
+    })(takeoverClaim!);
+    expect(takeoverOutcome).toEqual({ kind: "ack_completed" });
+    await expect(convergence.completeProgression(takeoverClaim!, { kind: "ack_completed" }))
+      .resolves.toBe(true);
+    expect(prompt).toHaveBeenCalledOnce();
+    expect(read).toHaveBeenCalledOnce();
+    const [settled] = await ownerSql<Array<{ state: string; assistantCount: number }>>`
+      select turn_row.state::text,
+        (select count(*)::integer from public.companion_transcript_entries entry
+          where entry.org_id = turn_row.org_id and entry.companion_id = turn_row.companion_id
+            and entry.event_id like 'v3:' || turn_row.id::text || ':%'
+            and entry.role = 'assistant') as "assistantCount"
+      from public.companion_v3_turns turn_row where turn_row.id = ${turnId}::uuid`;
+    expect(settled).toEqual({ state: "succeeded", assistantCount: 1 });
+
+    const nextCommand = randomUUID();
+    let nextTurnId = "";
+    await asApi(async (sql) => {
+      const rows = await sql<Array<{ turn: { id: string } }>>`
+        select turn from public.companion_v3_api_enqueue_warm_turn(
+          ${ids.org}::uuid, ${ids.companion}::uuid, ${nextCommand}::uuid,
+          'progress after admission takeover'
+        )`;
+      nextTurnId = rows[0]!.turn.id;
+    });
+    const nextClaim = await convergence.claimLane({
+      executorId: "runtime-after-admission-takeover", lane: "main",
+    });
+    expect(nextClaim?.turn.id).toBe(nextTurnId);
+    const nextOutcome = await createRuntimeV3WarmTurnAdvance({
+      persistence: basePersistence, pi,
+    })(nextClaim!);
+    expect(nextOutcome).toEqual({ kind: "ack_completed" });
+    await expect(convergence.completeProgression(nextClaim!, { kind: "ack_completed" }))
+      .resolves.toBe(true);
+    expect(prompt).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps an earlier context-loss notice pending across a later complete recovery", async () => {
+    const companionId = randomUUID();
+    try {
+      await createTestCompanion(companionId);
+      await seedPreparedV3("invocation-complete-after-loss", companionId);
+      await ownerSql`update public.companion_v3_instances
+        set context_loss_notice_pending = true
+        where org_id = ${ids.org}::uuid and companion_id = ${companionId}::uuid`;
+      const commandId = randomUUID();
+      await asApi(async (sql) => {
+        await sql`select turn from public.companion_v3_api_enqueue_warm_turn(
+          ${ids.org}::uuid, ${companionId}::uuid, ${commandId}::uuid,
+          'complete recovery must preserve an earlier notice'
+        )`;
+      });
+      const convergence = createRuntimeV3PostgresWarmConvergence(runtimeSql);
+      const claim = await convergence.claimLane({
+        executorId: "runtime-complete-after-loss", lane: "main",
+      });
+      expect(claim).not.toBeNull();
+      await expect(createRuntimeV3PostgresWarmTurnPersistence(runtimeSql).beginAdmission(claim!, {
+        invocationId: "invocation-complete-after-loss", cursor: 0n,
+      })).resolves.toBe(true);
+      await expect(convergence.completeProgression(claim!, {
+        kind: "interrupted",
+        error: {
+          code: "pi_admission_outcome_unknown",
+          message: "Pi may have acted on this message; it will not be sent again.",
+          action: "none",
+        },
+      })).resolves.toBe(true);
+      const [notice] = await ownerSql<Array<{ pending: boolean }>>`
+        select context_loss_notice_pending as pending
+        from public.companion_v3_instances
+        where org_id = ${ids.org}::uuid and companion_id = ${companionId}::uuid`;
+      expect(notice?.pending).toBe(true);
+    } finally {
+      await ownerSql`delete from public.companions where id = ${companionId}::uuid`;
+    }
+  });
+
+  it("proves complete recovery only after including durable tool and decision entries", async () => {
+    const companionId = randomUUID();
+    try {
+      await createTestCompanion(companionId);
+      await ownerSql`insert into public.companion_threads(
+        org_id, companion_id, next_ordinal, projection_sequence
+      ) values (${ids.org}::uuid, ${companionId}::uuid, 2, 2)`;
+      await ownerSql`insert into public.companion_transcript_entries(
+        org_id, companion_id, event_id, ordinal, projection_sequence, role, content, tool
+      ) values (
+        ${ids.org}::uuid, ${companionId}::uuid, ${`tool:${randomUUID()}`},
+        0, 1, 'tool', 'Tool output kept for recovery.', '{}'::jsonb
+      )`;
+      await ownerSql`insert into public.companion_transcript_entries(
+        org_id, companion_id, event_id, ordinal, projection_sequence, role, content, decision
+      ) values (
+        ${ids.org}::uuid, ${companionId}::uuid, ${`decision:${randomUUID()}`},
+        1, 2, 'decision', 'Decision answer kept for recovery.', '{}'::jsonb
+      )`;
+      const [recovery] = await ownerSql<Array<{
+        context: string; complete: boolean;
+      }>>`
+        select recovery_context as context, continuity_complete as complete
+        from public.companion_v3_build_recovery_context(
+          ${ids.org}::uuid, ${companionId}::uuid, 'invocation-contextual-roles', 2, 0
+        )`;
+      expect(recovery?.complete).toBe(true);
+      expect(recovery?.context).toContain("Tool: Tool output kept for recovery.");
+      expect(recovery?.context).toContain("Decision: Decision answer kept for recovery.");
+    } finally {
+      await ownerSql`delete from public.companions where id = ${companionId}::uuid`;
+    }
+  });
+
+  it("atomically emits one context-loss notice across concurrent lanes", async () => {
+    const warning = "I may have forgotten part of our earlier conversation while recovering.";
+    const recoveryContext = "Reserved durable recovery context.";
+    await seedPreparedV3("invocation-notice-race");
+    await ownerSql`update public.companion_v3_instances
+      set context_loss_notice_pending = true, recovery_context = ${recoveryContext},
+        recovery_context_sha256 = encode(sha256(convert_to(${recoveryContext}, 'UTF8')), 'hex'),
+        recovery_context_turn_id = null
+      where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid`;
+
+    const mainCommand = randomUUID();
+    const backgroundCommand = randomUUID();
+    await asApi(async (sql) => {
+      await sql`select turn from public.companion_v3_api_enqueue_warm_turn(
+        ${ids.org}::uuid, ${ids.companion}::uuid, ${mainCommand}::uuid, 'main after recovery'
+      )`;
+    });
+    await ownerSql`
+      with advanced as (
+        update public.companion_threads set next_ordinal = next_ordinal + 1,
+          projection_sequence = projection_sequence + 1
+        where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid
+        returning next_ordinal - 1 as ordinal, projection_sequence
+      )
+      insert into public.companion_transcript_entries(
+        org_id, companion_id, event_id, ordinal, projection_sequence, role, content
+      ) select ${ids.org}::uuid, ${ids.companion}::uuid, ${`msg:${backgroundCommand}`},
+        ordinal, projection_sequence, 'user', 'background after recovery' from advanced`;
+    await workerSql`select * from public.companion_v3_worker_admit_turn(
+      ${ids.org}::uuid, ${ids.companion}::uuid, ${backgroundCommand}::uuid,
+      ${`msg:${backgroundCommand}`}, ${ids.owner}
+    )`;
+
+    const convergence = createRuntimeV3PostgresWarmConvergence(runtimeSql);
+    const projection = createRuntimeV3PostgresWarmTurnPersistence(runtimeSql);
+    const initialMain = await convergence.claimLane({
+      executorId: "runtime-context-main", lane: "main",
+    });
+    const initialBackground = await convergence.claimLane({
+      executorId: "runtime-context-background", lane: "background",
+    });
+    expect(initialMain).not.toBeNull();
+    expect(initialBackground).not.toBeNull();
+    const initialClaims = [initialMain!, initialBackground!];
+    const initialMaterial = await Promise.all(initialClaims.map(async (claim) =>
+      await projection.authorize(claim)));
+    expect(initialMaterial.every((material) => material !== null)).toBe(true);
+    const reservedIndex = initialMaterial.findIndex((material) => !material!.recoveryDeferred);
+    const deferredIndex = initialMaterial.findIndex((material) => material!.recoveryDeferred);
+    expect([reservedIndex, deferredIndex].sort()).toEqual([0, 1]);
+    expect(initialMaterial[reservedIndex]!.content).toContain(recoveryContext);
+    expect(initialMaterial[deferredIndex]!.content).not.toContain(recoveryContext);
+
+    const refused = initialClaims[reservedIndex]!;
+    const refusedMaterial = initialMaterial[reservedIndex]!;
+    await expect(projection.beginAdmission(refused, {
+      invocationId: refusedMaterial.piInvocationId, cursor: refusedMaterial.cursor,
+    })).resolves.toBe(true);
+    await expect(convergence.completeProgression(refused, { kind: "release" }))
+      .resolves.toBe(true);
+    const [afterRefusal] = await ownerSql<Array<{
+      pending: boolean; context: string | null; reservedTurnId: string | null;
+    }>>`
+      select context_loss_notice_pending as pending, recovery_context as context,
+        recovery_context_turn_id as "reservedTurnId" from public.companion_v3_instances
+      where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid`;
+    expect(afterRefusal).toEqual({ pending: true, context: recoveryContext, reservedTurnId: null });
+
+    const acceptedFirst = initialClaims[deferredIndex]!;
+    const acceptedFirstMaterial = await projection.authorize(acceptedFirst);
+    expect(acceptedFirstMaterial).toMatchObject({ recoveryDeferred: false });
+    expect(acceptedFirstMaterial!.content).toContain(recoveryContext);
+    await expect(projection.beginAdmission(acceptedFirst, {
+      invocationId: acceptedFirstMaterial!.piInvocationId,
+      cursor: acceptedFirstMaterial!.cursor,
+    })).resolves.toBe(true);
+    await expect(projection.recordAdmission(acceptedFirst, {
+      invocationId: acceptedFirstMaterial!.piInvocationId,
+      responseTurnId: acceptedFirst.turn.id,
+      cursor: acceptedFirstMaterial!.cursor,
+    })).resolves.toBe(true);
+
+    const acceptedSecond = await convergence.claimLane({
+      executorId: "runtime-context-after-refusal", lane: refused.turn.lane,
+    });
+    expect(acceptedSecond).not.toBeNull();
+    const acceptedSecondMaterial = await projection.authorize(acceptedSecond!);
+    expect(acceptedSecondMaterial).toMatchObject({ recoveryDeferred: false });
+    expect(acceptedSecondMaterial!.content).not.toContain(recoveryContext);
+    await expect(projection.beginAdmission(acceptedSecond!, {
+      invocationId: acceptedSecondMaterial!.piInvocationId,
+      cursor: acceptedSecondMaterial!.cursor,
+    })).resolves.toBe(true);
+    await expect(projection.recordAdmission(acceptedSecond!, {
+      invocationId: acceptedSecondMaterial!.piInvocationId,
+      responseTurnId: acceptedSecond!.turn.id,
+      cursor: acceptedSecondMaterial!.cursor,
+    })).resolves.toBe(true);
+    const main = acceptedFirst.turn.lane === "main" ? acceptedFirst : acceptedSecond!;
+    const background = acceptedFirst.turn.lane === "background" ? acceptedFirst : acceptedSecond!;
+
+    await expect(projection.project(main, {
+      throughCursor: 1n, assistant: [], needsInput: false,
+      settled: false, processExited: false, activity: true,
+    })).resolves.toBe(true);
+    await expect(projection.project({
+      ...background, fence: { ...background.fence, token: randomUUID() },
+    }, {
+      throughCursor: 1n,
+      assistant: [{ eventId: `v3:${background.turn.id}:1`, content: "fenced" }],
+      needsInput: false, settled: true, processExited: false, activity: true,
+    })).resolves.toBe(false);
+    const [beforeConcurrentReplies] = await ownerSql<Array<{ pending: boolean }>>`
+      select context_loss_notice_pending as pending from public.companion_v3_instances
+      where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid`;
+    expect(beforeConcurrentReplies?.pending).toBe(true);
+
+    const mainEventId = `v3:${main.turn.id}:2`;
+    const backgroundEventId = `v3:${background.turn.id}:1`;
+    await expect(Promise.all([
+      projection.project(main, {
+        throughCursor: 2n,
+        assistant: [{ eventId: mainEventId, content: "Main answer." }],
+        needsInput: false, settled: true, processExited: false, activity: true,
+      }),
+      projection.project(background, {
+        throughCursor: 1n,
+        assistant: [{ eventId: backgroundEventId, content: "Background answer." }],
+        needsInput: false, settled: true, processExited: false, activity: true,
+      }),
+    ])).resolves.toEqual(["succeeded", "succeeded"]);
+
+    const replies = await ownerSql<Array<{ content: string }>>`
+      select content from public.companion_transcript_entries
+      where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid
+        and event_id in (${mainEventId}, ${backgroundEventId}) order by ordinal`;
+    expect(replies).toHaveLength(2);
+    expect(replies[0]!.content.startsWith(`${warning}\n\n`)).toBe(true);
+    expect(replies.filter((reply) => reply.content.startsWith(`${warning}\n\n`))).toHaveLength(1);
+    const [afterConcurrentReplies] = await ownerSql<Array<{ pending: boolean }>>`
+      select context_loss_notice_pending as pending from public.companion_v3_instances
+      where org_id = ${ids.org}::uuid and companion_id = ${ids.companion}::uuid`;
+    expect(afterConcurrentReplies?.pending).toBe(false);
+  });
+
+  it("terminalizes ambiguity when a multibyte durable suffix reaches the context byte bound", async () => {
+    const companionId = randomUUID();
+    const oversizedEventId = `context-boundary:${randomUUID()}`;
+    try {
+      await createTestCompanion(companionId);
+      await seedPreparedV3("invocation-context-boundary", companionId);
+      await ownerSql`insert into public.companion_threads(org_id, companion_id)
+        values (${ids.org}::uuid, ${companionId}::uuid)`;
+      await ownerSql`
+        with advanced as (
+          update public.companion_threads set next_ordinal = next_ordinal + 1,
+            projection_sequence = projection_sequence + 1
+          where org_id = ${ids.org}::uuid and companion_id = ${companionId}::uuid
+          returning next_ordinal - 1 as ordinal, projection_sequence
+        )
+        insert into public.companion_transcript_entries(
+          org_id, companion_id, event_id, ordinal, projection_sequence, role, content
+        ) select ${ids.org}::uuid, ${companionId}::uuid, ${oversizedEventId},
+          ordinal, projection_sequence, 'assistant', repeat('é', 32750) from advanced`;
+      const commandId = randomUUID();
+      await asApi(async (sql) => {
+        await sql`select turn from public.companion_v3_api_enqueue_warm_turn(
+          ${ids.org}::uuid, ${companionId}::uuid, ${commandId}::uuid,
+          'terminalize at the byte boundary'
+        )`;
+      });
+      const convergence = createRuntimeV3PostgresWarmConvergence(runtimeSql);
+      const claim = await convergence.claimLane({
+        executorId: "runtime-context-boundary", lane: "main",
+      });
+      expect(claim).not.toBeNull();
+      await expect(createRuntimeV3PostgresWarmTurnPersistence(runtimeSql).beginAdmission(claim!, {
+        invocationId: "invocation-context-boundary", cursor: 0n,
+      })).resolves.toBe(true);
+      await expect(convergence.completeProgression(claim!, {
+        kind: "interrupted",
+        error: {
+          code: "pi_admission_outcome_unknown",
+          message: "Pi may have acted on this message; it will not be sent again.",
+          action: "none",
+        },
+      })).resolves.toBe(true);
+      const [facts] = await ownerSql<Array<{
+        state: string; code: string; contextBytes: number; noticePending: boolean;
+      }>>`
+        select turn_row.state::text, turn_row.outcome_code as code,
+          octet_length(instance.recovery_context)::integer as "contextBytes",
+          instance.context_loss_notice_pending as "noticePending"
+        from public.companion_v3_turns turn_row
+        join public.companion_v3_instances instance using (org_id, companion_id)
+        where turn_row.command_id = ${commandId}::uuid`;
+      expect(facts).toMatchObject({
+        state: "interrupted", code: "pi_admission_ambiguous", noticePending: true,
+      });
+      expect(facts!.contextBytes).toBeLessThanOrEqual(65_536);
+
+      await ownerSql`update public.companion_v3_instances set
+        pi_recycle_checkpoint = null, recycle_pi_invocation_id = null, recovery_turn_id = null
+        where org_id = ${ids.org}::uuid and companion_id = ${companionId}::uuid`;
+      await seedPreparedV3("invocation-context-boundary-healed", companionId);
+      const nextCommand = randomUUID();
+      await asApi(async (sql) => {
+        await sql`select turn from public.companion_v3_api_enqueue_warm_turn(
+          ${ids.org}::uuid, ${companionId}::uuid, ${nextCommand}::uuid,
+          'answer after truncated recovery'
+        )`;
+      });
+      const nextClaim = await convergence.claimLane({
+        executorId: "runtime-context-boundary-healed", lane: "main",
+      });
+      expect(nextClaim).not.toBeNull();
+      const persistence = createRuntimeV3PostgresWarmTurnPersistence(runtimeSql);
+      const nextMaterial = await persistence.authorize(nextClaim!);
+      expect(nextMaterial).not.toBeNull();
+      await expect(persistence.beginAdmission(nextClaim!, {
+        invocationId: nextMaterial!.piInvocationId, cursor: nextMaterial!.cursor,
+      })).resolves.toBe(true);
+      await expect(persistence.recordAdmission(nextClaim!, {
+        invocationId: nextMaterial!.piInvocationId,
+        responseTurnId: nextClaim!.turn.id, cursor: nextMaterial!.cursor,
+      })).resolves.toBe(true);
+      const warning = "I may have forgotten part of our earlier conversation while recovering.";
+      const replyEventId = `v3:${nextClaim!.turn.id}:1`;
+      await expect(persistence.project(nextClaim!, {
+        throughCursor: 1n,
+        assistant: [{ eventId: replyEventId, content: "Recovered after truncation." }],
+        needsInput: false, settled: true, processExited: false, activity: true,
+      })).resolves.toBe("succeeded");
+      const [reply] = await ownerSql<Array<{ content: string }>>`
+        select content from public.companion_transcript_entries
+        where org_id = ${ids.org}::uuid and companion_id = ${companionId}::uuid
+          and event_id = ${replyEventId}`;
+      expect(reply?.content).toBe(`${warning}\n\nRecovered after truncation.`);
+      expect(reply?.content.match(new RegExp(warning, "g"))).toHaveLength(1);
+      const [afterReply] = await ownerSql<Array<{ pending: boolean }>>`
+        select context_loss_notice_pending as pending from public.companion_v3_instances
+        where org_id = ${ids.org}::uuid and companion_id = ${companionId}::uuid`;
+      expect(afterReply?.pending).toBe(false);
+    } finally {
+      await ownerSql`delete from public.companions where id = ${companionId}::uuid`;
+    }
   });
 
   it("sweeps inactivity and absolute deadlines while needs-input pauses only inactivity", async () => {
@@ -2069,7 +3263,9 @@ describe("Runtime v3 progression facts", () => {
         lane: "main",
       });
       expect(claim).not.toBeNull();
-      await expect(persistence.beginAdmission!(claim!)).resolves.toBe(true);
+      await expect(persistence.beginAdmission!(claim!, {
+        invocationId: "invocation-deadlines", cursor: 0n,
+      })).resolves.toBe(true);
       await expect(persistence.recordAdmission(claim!, {
         invocationId: "invocation-deadlines",
         responseTurnId: turnId,
@@ -2158,11 +3354,15 @@ describe("Runtime v3 progression facts", () => {
 
   it("settles sixty-five overdue Turns in one deadline convergence", async () => {
     const companionIds = Array.from({ length: 65 }, () => randomUUID());
+    const invocationByCompanion = new Map<string, string>();
     const convergence = createRuntimeV3PostgresConvergence(runtimeSql);
     const projection = createRuntimeV3PostgresWarmTurnPersistence(runtimeSql);
     try {
       for (const companionId of companionIds) {
         await createTestCompanion(companionId);
+        const invocationId = `invocation-deadline-batch-${invocationByCompanion.size}`;
+        invocationByCompanion.set(companionId, invocationId);
+        await seedPreparedV3(invocationId, companionId);
         const command = randomUUID();
         await asApi(async (sql) => {
           await sql`select * from public.companion_v3_api_admit_turn(
@@ -2175,9 +3375,12 @@ describe("Runtime v3 progression facts", () => {
           executorId: `runtime-deadline-batch-${index}`, lane: "main",
         });
         expect(claim).not.toBeNull();
-        await expect(projection.beginAdmission(claim!)).resolves.toBe(true);
+        const invocationId = invocationByCompanion.get(claim!.companionId)!;
+        await expect(projection.beginAdmission(claim!, {
+          invocationId, cursor: 0n,
+        })).resolves.toBe(true);
         await expect(projection.recordAdmission(claim!, {
-          invocationId: `invocation-deadline-batch-${index}`,
+          invocationId,
           responseTurnId: claim!.turn.id,
           cursor: 0n,
         })).resolves.toBe(true);
@@ -2204,6 +3407,19 @@ describe("Runtime v3 progression facts", () => {
   });
 
   it("forces RLS and keeps v3 facts behind split role grants", async () => {
+    const grantsSource = await readFile(fileURLToPath(
+      new URL("../../../../packages/db/runtime-role-grants.sql", import.meta.url),
+    ), "utf8");
+    const begin = grantsSource.indexOf("-- companion-runtime-grants-begin");
+    const end = grantsSource.indexOf("-- companion-runtime-grants-end");
+    await ownerSql`select
+      set_config('companion.api_role', ${apiRole}, false),
+      set_config('companion.worker_role', ${workerRole}, false),
+      set_config('companion.companion_runtime_role', ${runtimeRole}, false),
+      set_config('companion.retired_runtime_role', '', false)`;
+    await ownerSql.unsafe(grantsSource.slice(
+      begin + "-- companion-runtime-grants-begin".length, end,
+    ).trim());
     const tables = await ownerSql<Array<{ name: string; rls: boolean; forced: boolean }>>`
       select relname as name, relrowsecurity as rls, relforcerowsecurity as forced
       from pg_catalog.pg_class
@@ -2229,6 +3445,10 @@ describe("Runtime v3 progression facts", () => {
       runtimeAdmit: boolean;
       runtimeClaim: boolean;
       runtimeBoundedClaim: boolean;
+      runtimeLegacyAdmission: boolean;
+      runtimeLegacyProjection: boolean;
+      runtimeLegacyPreparation: boolean;
+      runtimeRecyclePreparation: boolean;
     }>>`
       select
         has_function_privilege(${apiRole},
@@ -2244,7 +3464,15 @@ describe("Runtime v3 progression facts", () => {
         has_function_privilege(${runtimeRole},
           'public.companion_v3_runtime_claim(text,public.companion_v3_lane,integer,integer)', 'EXECUTE') as "runtimeClaim",
         has_function_privilege(${runtimeRole},
-          'public.companion_v3_runtime_claim_v4(text,public.companion_v3_lane,integer,integer)', 'EXECUTE') as "runtimeBoundedClaim"`;
+          'public.companion_v3_runtime_claim_v4(text,public.companion_v3_lane,integer,integer)', 'EXECUTE') as "runtimeBoundedClaim",
+        has_function_privilege(${runtimeRole},
+          'public.companion_v3_runtime_record_native_admission(uuid,uuid,public.companion_v3_lane,uuid,uuid,bigint,bigint,text,uuid,bigint,integer)', 'EXECUTE') as "runtimeLegacyAdmission",
+        has_function_privilege(${runtimeRole},
+          'public.companion_v3_runtime_project_native_page_v4(uuid,uuid,public.companion_v3_lane,uuid,uuid,bigint,bigint,bigint,jsonb,boolean,boolean,text,integer)', 'EXECUTE') as "runtimeLegacyProjection",
+        has_function_privilege(${runtimeRole},
+          'public.companion_v3_runtime_checkpoint_preparation(uuid,uuid,uuid,bigint,bigint,text,text,text,text,integer,bigint,integer,text,timestamp with time zone,integer)', 'EXECUTE') as "runtimeLegacyPreparation",
+        has_function_privilege(${runtimeRole},
+          'public.companion_v3_runtime_checkpoint_preparation_v6(uuid,uuid,uuid,bigint,bigint,text,text,text,text,integer,bigint,integer,text,timestamp with time zone,integer)', 'EXECUTE') as "runtimeRecyclePreparation"`;
     expect(grants).toEqual([{
       apiAdmit: true,
       apiClaim: false,
@@ -2253,6 +3481,10 @@ describe("Runtime v3 progression facts", () => {
       runtimeAdmit: false,
       runtimeClaim: false,
       runtimeBoundedClaim: true,
+      runtimeLegacyAdmission: false,
+      runtimeLegacyProjection: false,
+      runtimeLegacyPreparation: false,
+      runtimeRecyclePreparation: true,
     }]);
     await expect(apiSql`select * from public.companion_v3_turns`).rejects.toMatchObject({ code: "42501" });
     await expect(workerSql`select * from public.companion_v3_turns`).rejects.toMatchObject({ code: "42501" });

@@ -154,6 +154,7 @@ export type RuntimeV3Convergence = Pick<RuntimeV3Progression, "converge">;
 
 export type RuntimeV3PreparationCheckpoint =
   | "pending" | "box_created" | "box_ready" | "staged";
+export type RuntimeV3PiRecycleCheckpoint = "terminate" | "reset" | "ready" | null;
 
 export interface RuntimeV3PreparationClaim {
   executorId: string;
@@ -162,6 +163,10 @@ export interface RuntimeV3PreparationClaim {
   turnId: string | null;
   commandId: string | null;
   checkpoint: RuntimeV3PreparationCheckpoint;
+  piRecycleCheckpoint?: RuntimeV3PiRecycleCheckpoint;
+  recyclePiInvocationId?: string | null;
+  recoveryId?: string | null;
+  recoveryContext?: string | null;
   boxIdempotencyKey: string;
   boxId: string | null;
   createdAt: Date;
@@ -218,6 +223,16 @@ export interface RuntimeV3PreparationPersistence {
     },
     signal?: AbortSignal,
   ): Promise<boolean>;
+  checkpointPiRecycle?(
+    claim: RuntimeV3PreparationClaim,
+    next: "reset" | "complete",
+    signal?: AbortSignal,
+  ): Promise<boolean>;
+  reconcilePiRecycleInvocation?(
+    claim: RuntimeV3PreparationClaim,
+    input: { expectedInvocationId: string; observedInvocationId: string },
+    signal?: AbortSignal,
+  ): Promise<boolean>;
   defer(
     claim: RuntimeV3PreparationClaim,
     input: { delaySeconds: number; error: SafeRuntimeError | null },
@@ -242,7 +257,9 @@ export interface RuntimeV3PreparationOptions {
   persistence: RuntimeV3PreparationPersistence;
   box: Pick<RuntimeBoxControl, "createGenerationBox" | "applyGenerationBoxSettings" | "getStatus">;
   preparationStager: RuntimeV3PreparationStager;
-  pi: Pick<RuntimePiControl, "startPiDaemon">;
+  pi: Pick<RuntimePiControl, "startPiDaemon">
+    & Partial<Pick<RuntimePiControl,
+      "terminatePiInvocation" | "resetPiSession" | "piDaemonStatus">>;
   observePreparedLatency?: (durationMs: number) => void;
   now?: () => Date;
   jitter?: () => number;
@@ -331,11 +348,21 @@ export interface RuntimeV3WarmTurnMaterial {
   piInvocationId: string;
   content: string;
   cursor: bigint;
+  recoveryDeferred?: boolean;
 }
 
 export interface RuntimeV3WarmTurnProjection {
   throughCursor: bigint;
   assistant: Array<{ eventId: string; content: string }>;
+  compactions?: Array<{
+    cursor: bigint;
+    summary: string;
+    firstKeptEntryId: string;
+    tokensBefore: number;
+    estimatedTokensAfter: number;
+    cacheRead: number | null;
+    cacheWrite: number | null;
+  }>;
   needsInput: boolean;
   settled: boolean;
   processExited: boolean;
@@ -349,6 +376,7 @@ export interface RuntimeV3WarmTurnPersistence {
   ): Promise<RuntimeV3WarmTurnMaterial | null>;
   beginAdmission(
     claim: RuntimeV3Claim,
+    input: { invocationId: string; cursor: bigint },
     signal?: AbortSignal,
   ): Promise<boolean>;
   recordAdmission(
@@ -454,17 +482,29 @@ export function createRuntimeV3WarmTurnAdvance(
 ): RuntimeV3ConvergenceOptions["advance"] {
   return async (claim, signal) => {
     let projectionPendingAck: "none" | "nonterminal" | "terminal" = "none";
+    let projectionWriteIntent = false;
+    let prePiHandoff = false;
     let admissionWriteIntent = false;
+    let durableAdmissionRecorded = false;
     let inactivityDeadlineAt = claim.turn.inactivityDeadlineAt ?? null;
     let absoluteDeadlineAt = claim.turn.absoluteDeadlineAt ?? null;
     let durableNeedsInput = claim.turn.state === "needs_input";
     try {
       signal?.throwIfAborted();
+      if (claim.turn.state === "queued" && claim.turn.admissionStartedAt) {
+        return {
+          kind: "interrupted",
+          code: "pi_admission_outcome_unknown",
+          message: "Pi may have acted on this message; it will not be sent again.",
+          action: "none",
+        };
+      }
+      prePiHandoff = claim.turn.state === "queued";
       const material = signal
         ? await options.persistence.authorize(claim, signal)
         : await options.persistence.authorize(claim);
-      signal?.throwIfAborted();
       if (!material) {
+        prePiHandoff = false;
         return {
           kind: "failed",
           code: "warm_turn_unauthorized",
@@ -472,6 +512,8 @@ export function createRuntimeV3WarmTurnAdvance(
           action: "none",
         };
       }
+      if (material.recoveryDeferred) return { kind: "release" };
+      signal?.throwIfAborted();
       let invocationId = material.piInvocationId;
       let cursor = material.cursor;
       if (claim.turn.state === "succeeded" || claim.turn.state === "failed") {
@@ -485,26 +527,15 @@ export function createRuntimeV3WarmTurnAdvance(
         return { kind: "ack_completed" };
       }
       if (claim.turn.state === "queued") {
-        if (claim.turn.admissionStartedAt) {
-          return {
-            kind: "interrupted",
-            code: "pi_admission_outcome_unknown",
-            message: "Pi admission may have occurred before executor takeover.",
-            action: "none",
-          };
-        }
+        const admissionFence = { invocationId: material.piInvocationId, cursor: material.cursor };
         const begun = signal
-          ? await options.persistence.beginAdmission(claim, signal)
-          : await options.persistence.beginAdmission(claim);
-        signal?.throwIfAborted();
+          ? await options.persistence.beginAdmission(claim, admissionFence, signal)
+          : await options.persistence.beginAdmission(claim, admissionFence);
         if (!begun) {
-          return {
-            kind: "interrupted",
-            code: "pi_admission_fence_lost",
-            message: "Pi admission could not be fenced safely.",
-            action: "none",
-          };
+          return { kind: "release" };
         }
+        signal?.throwIfAborted();
+        prePiHandoff = false;
         admissionWriteIntent = true;
         const admissionTimeout = AbortSignal.timeout(
           COMPANION_RUNTIME_V3_BUDGETS.admissionAckMs,
@@ -520,18 +551,19 @@ export function createRuntimeV3WarmTurnAdvance(
           message: material.content,
           signal: admissionSignal,
         });
-        signal?.throwIfAborted();
         if (admission.outcome === "rejected") {
+          admissionWriteIntent = false;
           return { kind: "release" };
         }
         if (admission.outcome === "ambiguous") {
           return {
             kind: "interrupted",
             code: "pi_admission_ambiguous",
-            message: "Pi admission could not be confirmed.",
+            message: "Pi may have acted on this message; it will not be sent again.",
             action: "none",
           };
         }
+        signal?.throwIfAborted();
         const admissionRecord = {
           invocationId: admission.invocationId,
           responseTurnId: admission.responseAttemptId ?? claim.turn.id,
@@ -540,16 +572,19 @@ export function createRuntimeV3WarmTurnAdvance(
         const admitted = signal
           ? await options.persistence.recordAdmission(claim, admissionRecord, signal)
           : await options.persistence.recordAdmission(claim, admissionRecord);
+        if (admitted) {
+          admissionWriteIntent = false;
+          durableAdmissionRecorded = true;
+        }
         signal?.throwIfAborted();
         if (!admitted) {
           return {
             kind: "interrupted",
             code: "pi_admission_fence_lost",
-            message: "Pi admission could not be recorded safely.",
+            message: "Pi may have acted on this message; it will not be sent again.",
             action: "none",
           };
         }
-        admissionWriteIntent = false;
         const admittedAt = Date.now();
         absoluteDeadlineAt ??= new Date(admittedAt + COMPANION_BUDGETS.turnAbsoluteDeadlineMs);
         inactivityDeadlineAt ??= new Date(Math.min(
@@ -619,18 +654,30 @@ export function createRuntimeV3WarmTurnAdvance(
         const projection = {
           throughCursor: classified.throughCursor,
           assistant,
+          compactions: classified.projections.flatMap((item) => item.type === "compaction"
+            ? [{
+              cursor: item.sequence,
+              summary: item.summary,
+              firstKeptEntryId: item.first_kept_entry_id,
+              tokensBefore: item.tokens_before,
+              estimatedTokensAfter: item.estimated_tokens_after,
+              cacheRead: item.cache_read,
+              cacheWrite: item.cache_write,
+            }]
+            : []),
           needsInput: projectedNeedsInput,
           settled: classified.settled,
           processExited: classified.processExit !== null,
           activity: classified.activity,
         };
+        projectionWriteIntent = true;
         const projected = await options.persistence.project(claim, projection, commandSignal);
+        projectionWriteIntent = false;
         if (projected) {
           projectionPendingAck = projected === "succeeded" || projected === "failed"
             ? "terminal"
             : "nonterminal";
         }
-        signal?.throwIfAborted();
         if (!projected) {
           return {
             kind: "interrupted",
@@ -639,6 +686,7 @@ export function createRuntimeV3WarmTurnAdvance(
             action: "none",
           };
         }
+        signal?.throwIfAborted();
         await options.pi.acknowledge({
           boxId: material.boxId,
           through: classified.throughCursor,
@@ -686,11 +734,15 @@ export function createRuntimeV3WarmTurnAdvance(
         return { kind: "retry_ack" };
       }
       if (projectionPendingAck === "nonterminal") return { kind: "release" };
+      if (projectionWriteIntent || (durableAdmissionRecorded && signal?.aborted)) {
+        return { kind: "release" };
+      }
+      if (prePiHandoff) return { kind: "release" };
       if (admissionWriteIntent) {
         return {
           kind: "interrupted",
           code: "pi_admission_outcome_unknown",
-          message: "Pi admission could not be confirmed before executor handoff.",
+          message: "Pi may have acted on this message; it will not be sent again.",
           action: "none",
         };
       }
@@ -943,7 +995,83 @@ export function createRuntimeV3Preparation(
           boundedSignal(deadlineSignal, timeoutMs);
         try {
           if (!claim.authorized) throw new Error("Runtime v3 preparation is not authorized");
-          if (claim.checkpoint === "pending") {
+          if (claim.piRecycleCheckpoint === "terminate") {
+            if (!claim.boxId || !claim.recyclePiInvocationId || !claim.recoveryId) {
+              throw new Error("Fenced Pi recycle identity is incomplete");
+            }
+            if (!options.pi.terminatePiInvocation || !options.persistence.checkpointPiRecycle) {
+              throw new Error("Fenced Pi recycle boundary is unavailable");
+            }
+            if (!await options.persistence.reauthorize(claim, deadlineSignal)) {
+              throw new Error("Runtime v3 preparation authorization changed");
+            }
+            const terminationSignal = phaseSignal(RUNTIME_V3_PI_ACTIVATION_BUDGET_MS);
+            let stopped = await options.pi.terminatePiInvocation({
+              boxId: claim.boxId,
+              expectedInvocationId: claim.recyclePiInvocationId,
+              signal: terminationSignal,
+            });
+            terminationSignal.throwIfAborted();
+            shutdownSignal?.throwIfAborted();
+            if (stopped.outcome === "superseded") {
+              if (!options.pi.piDaemonStatus
+                || !options.persistence.reconcilePiRecycleInvocation) {
+                throw new Error("Superseded Pi recycle reconciliation is unavailable");
+              }
+              const observationSignal = phaseSignal(RUNTIME_V3_PI_ACTIVATION_BUDGET_MS);
+              const observed = await options.pi.piDaemonStatus({
+                boxId: claim.boxId,
+                signal: observationSignal,
+              });
+              observationSignal.throwIfAborted();
+              shutdownSignal?.throwIfAborted();
+              if (observed.state !== "idle" || !observed.invocationId
+                || observed.invocationId === claim.recyclePiInvocationId) {
+                throw new Error("Superseded Pi invocation could not be proven idle and distinct");
+              }
+              if (!await options.persistence.reconcilePiRecycleInvocation(claim, {
+                expectedInvocationId: claim.recyclePiInvocationId,
+                observedInvocationId: observed.invocationId,
+              }, deadlineSignal)) {
+                return { progressed, exhausted: false };
+              }
+              const reconciledTerminationSignal = phaseSignal(RUNTIME_V3_PI_ACTIVATION_BUDGET_MS);
+              stopped = await options.pi.terminatePiInvocation({
+                boxId: claim.boxId,
+                expectedInvocationId: observed.invocationId,
+                signal: reconciledTerminationSignal,
+              });
+              reconciledTerminationSignal.throwIfAborted();
+              shutdownSignal?.throwIfAborted();
+              if (stopped.outcome === "superseded") {
+                throw new Error("Reconciled Pi invocation changed before exact termination");
+              }
+            }
+            if (!await options.persistence.checkpointPiRecycle(claim, "reset", deadlineSignal)) {
+              return { progressed, exhausted: false };
+            }
+          } else if (claim.piRecycleCheckpoint === "reset") {
+            if (!claim.boxId || !claim.recoveryId) {
+              throw new Error("Fenced Pi recycle identity is incomplete");
+            }
+            if (!await options.persistence.reauthorize(claim, deadlineSignal)) {
+              throw new Error("Runtime v3 preparation authorization changed");
+            }
+            if (!options.pi.resetPiSession || !options.persistence.checkpointPiRecycle) {
+              throw new Error("Fenced Pi recycle boundary is unavailable");
+            }
+            const resetSignal = phaseSignal(RUNTIME_V3_STAGING_BUDGET_MS);
+            await options.pi.resetPiSession({
+              boxId: claim.boxId,
+              recoveryId: claim.recoveryId,
+              signal: resetSignal,
+            });
+            resetSignal.throwIfAborted();
+            shutdownSignal?.throwIfAborted();
+            if (!await options.persistence.checkpointPiRecycle(claim, "complete", deadlineSignal)) {
+              return { progressed, exhausted: false };
+            }
+          } else if (claim.checkpoint === "pending") {
             if (!await options.persistence.reauthorize(claim, deadlineSignal)) {
               throw new Error("Runtime v3 preparation authorization changed");
             }

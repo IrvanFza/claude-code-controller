@@ -121,7 +121,7 @@ function createPostgresConvergence(
             gate_epoch::text as "gateEpoch", admission_started_at as "admissionStartedAt",
             inactivity_deadline_at as "inactivityDeadlineAt",
             absolute_deadline_at as "absoluteDeadlineAt"
-          from public.companion_v3_runtime_claim_warm_v4(${executorId}, ${lane}, 30, 4)
+          from public.companion_v3_runtime_claim_warm_v5(${executorId}, ${lane}, 30, 5)
         `, signal)
         : await abortable(sql<ClaimRow[]>`
           select org_id as "orgId", companion_id as "companionId", turn_id as "turnId",
@@ -149,7 +149,7 @@ function createPostgresConvergence(
     async completeProgression(claim, outcome, signal) {
       const terminal = terminalInput(outcome);
       const rows = await abortable(sql<Array<{ completed: boolean }>>`
-        select public.companion_v3_runtime_complete_v4(
+        select public.companion_v3_runtime_complete_v5(
           ${claim.orgId}::uuid,
           ${claim.companionId}::uuid,
           ${claim.turn.lane},
@@ -161,7 +161,7 @@ function createPostgresConvergence(
           ${terminal.code},
           ${terminal.message},
           ${terminal.action}::public.companion_runtime_error_action,
-          4
+          5
         ) as completed
       `, signal);
       return rows[0]?.completed === true;
@@ -174,6 +174,7 @@ interface WarmMaterialRow {
   piInvocationId: string;
   content: string;
   activityCursor: string;
+  recoveryDeferred: boolean;
 }
 
 interface PreparationClaimRow {
@@ -182,6 +183,10 @@ interface PreparationClaimRow {
   turnId: string | null;
   commandId: string | null;
   checkpoint: "pending" | "box_created" | "box_ready" | "staged";
+  piRecycleCheckpoint: "terminate" | "reset" | "ready" | null;
+  recyclePiInvocationId: string | null;
+  recoveryId: string | null;
+  recoveryContext: string | null;
   boxIdempotencyKey: string;
   boxId: string | null;
   claimToken: string;
@@ -305,9 +310,12 @@ export function createRuntimeV3PostgresPreparationPersistence(
           settings_revision::text as "settingsRevision", skills_revision as "skillsRevision",
           provider_refs as "providerRefs", skill_refs as "skillRefs", mcp_refs as "mcpRefs",
           provider_material as "providerMaterial", skill_material as "skillMaterial",
-          mcp_material as "mcpMaterial", config_catalog as "configCatalog"
-        from public.companion_v3_runtime_claim_preparation_v5(
-          ${executorId}, ${PREPARATION_LEASE_SECONDS}, 5
+          mcp_material as "mcpMaterial", config_catalog as "configCatalog",
+          pi_recycle_checkpoint as "piRecycleCheckpoint",
+          recycle_pi_invocation_id as "recyclePiInvocationId",
+          recovery_id as "recoveryId", recovery_context as "recoveryContext"
+        from public.companion_v3_runtime_claim_preparation_v6(
+          ${executorId}, ${PREPARATION_LEASE_SECONDS}, 6
         )
       `, signal);
       const row = rows[0];
@@ -327,6 +335,10 @@ export function createRuntimeV3PostgresPreparationPersistence(
         turnId: row.turnId,
         commandId: row.commandId,
         checkpoint: row.checkpoint,
+        piRecycleCheckpoint: row.piRecycleCheckpoint,
+        recyclePiInvocationId: row.recyclePiInvocationId,
+        recoveryId: row.recoveryId,
+        recoveryContext: row.recoveryContext,
         boxIdempotencyKey: row.boxIdempotencyKey,
         boxId: row.boxId,
         createdAt: row.createdAt,
@@ -354,7 +366,7 @@ export function createRuntimeV3PostgresPreparationPersistence(
     },
     async checkpoint(claim, input, signal) {
       const rows = await abortable(sql<Array<{ checkpointed: boolean }>>`
-        select public.companion_v3_runtime_checkpoint_preparation(
+        select public.companion_v3_runtime_checkpoint_preparation_v6(
           ${claim.orgId}::uuid, ${claim.companionId}::uuid,
           ${claim.fence.token}::uuid, ${claim.fence.epoch.toString()}::bigint,
           ${claim.fence.gateEpoch.toString()}::bigint, ${claim.checkpoint}, ${input.next},
@@ -362,10 +374,34 @@ export function createRuntimeV3PostgresPreparationPersistence(
           ${input.diskLayoutVersion ?? null},
           ${input.appliedSettingsRevision?.toString() ?? null}::bigint,
           ${input.appliedSkillsRevision ?? null}, ${input.skillsDigest ?? null},
-          ${input.materialExpiresAt ?? null}, 4
+          ${input.materialExpiresAt ?? null}, 6
         ) as checkpointed
       `, signal);
       return rows[0]?.checkpointed === true;
+    },
+    async checkpointPiRecycle(claim, next, signal) {
+      const checkpoint = claim.piRecycleCheckpoint;
+      if (!checkpoint) return false;
+      const rows = await abortable(sql<Array<{ checkpointed: boolean }>>`
+        select public.companion_v3_runtime_checkpoint_pi_recycle(
+          ${claim.orgId}::uuid, ${claim.companionId}::uuid,
+          ${claim.fence.token}::uuid, ${claim.fence.epoch.toString()}::bigint,
+          ${claim.fence.gateEpoch.toString()}::bigint,
+          ${checkpoint}, ${next}, 6
+        ) as checkpointed
+      `, signal);
+      return rows[0]?.checkpointed === true;
+    },
+    async reconcilePiRecycleInvocation(claim, input, signal) {
+      const rows = await abortable(sql<Array<{ reconciled: boolean }>>`
+        select public.companion_v3_runtime_reconcile_pi_recycle_invocation(
+          ${claim.orgId}::uuid, ${claim.companionId}::uuid,
+          ${claim.fence.token}::uuid, ${claim.fence.epoch.toString()}::bigint,
+          ${claim.fence.gateEpoch.toString()}::bigint,
+          ${input.expectedInvocationId}, ${input.observedInvocationId}, 6
+        ) as reconciled
+      `, signal);
+      return rows[0]?.reconciled === true;
     },
     async defer(claim, input, signal) {
       const rows = await abortable(sql<Array<{ deferred: boolean }>>`
@@ -418,8 +454,9 @@ export function createRuntimeV3PostgresWarmTurnPersistence(
     async authorize(claim, signal) {
       const rows = await abortable(sql<WarmMaterialRow[]>`
         select box_id as "boxId", pi_invocation_id as "piInvocationId",
-          content, activity_cursor::text as "activityCursor"
-        from public.companion_v3_runtime_authorize_warm_turn(
+          content, activity_cursor::text as "activityCursor",
+          recovery_deferred as "recoveryDeferred"
+        from public.companion_v3_runtime_authorize_warm_turn_v5(
           ${claim.orgId}::uuid,
           ${claim.companionId}::uuid,
           ${claim.turn.lane},
@@ -427,7 +464,7 @@ export function createRuntimeV3PostgresWarmTurnPersistence(
           ${claim.fence.token}::uuid,
           ${claim.fence.epoch.toString()}::bigint,
           ${claim.fence.gateEpoch.toString()}::bigint,
-          3
+          5
         )
       `, signal);
       const row = rows[0];
@@ -437,12 +474,13 @@ export function createRuntimeV3PostgresWarmTurnPersistence(
           piInvocationId: row.piInvocationId,
           content: row.content,
           cursor: BigInt(row.activityCursor),
+          recoveryDeferred: row.recoveryDeferred,
         }
         : null;
     },
-    async beginAdmission(claim, signal) {
+    async beginAdmission(claim, input, signal) {
       const rows = await abortable(sql<Array<{ begun: boolean }>>`
-        select public.companion_v3_runtime_begin_admission(
+        select public.companion_v3_runtime_begin_admission_v5(
           ${claim.orgId}::uuid,
           ${claim.companionId}::uuid,
           ${claim.turn.lane},
@@ -450,14 +488,14 @@ export function createRuntimeV3PostgresWarmTurnPersistence(
           ${claim.fence.token}::uuid,
           ${claim.fence.epoch.toString()}::bigint,
           ${claim.fence.gateEpoch.toString()}::bigint,
-          4
+          ${input.invocationId}, ${input.cursor.toString()}::bigint, 5
         ) as begun
       `, signal);
       return rows[0]?.begun === true;
     },
     async recordAdmission(claim, input, signal) {
       const rows = await abortable(sql<Array<{ recorded: boolean }>>`
-        select public.companion_v3_runtime_record_native_admission(
+        select public.companion_v3_runtime_record_native_admission_v5(
           ${claim.orgId}::uuid,
           ${claim.companionId}::uuid,
           ${claim.turn.lane},
@@ -468,14 +506,14 @@ export function createRuntimeV3PostgresWarmTurnPersistence(
           ${input.invocationId},
           ${input.responseTurnId}::uuid,
           ${input.cursor.toString()}::bigint,
-          3
+          5
         ) as recorded
       `, signal);
       return rows[0]?.recorded === true;
     },
     async project(claim, projection, signal) {
       const rows = await abortable(sql<Array<{ projected: string | null }>>`
-        select public.companion_v3_runtime_project_native_page_v4(
+        select public.companion_v3_runtime_project_native_page_v5(
           ${claim.orgId}::uuid,
           ${claim.companionId}::uuid,
           ${claim.turn.lane},
@@ -485,10 +523,14 @@ export function createRuntimeV3PostgresWarmTurnPersistence(
           ${claim.fence.gateEpoch.toString()}::bigint,
           ${projection.throughCursor.toString()}::bigint,
           ${sql.json(projection.assistant)}::jsonb,
+          ${sql.json((projection.compactions ?? []).map((item) => ({
+            ...item,
+            cursor: item.cursor.toString(),
+          })))}::jsonb,
           ${projection.needsInput},
           ${projection.activity},
           ${projection.processExited ? "process_exit" : projection.settled ? "settled" : null},
-          4
+          5
         ) as projected
       `, signal);
       const projected = rows[0]?.projected;

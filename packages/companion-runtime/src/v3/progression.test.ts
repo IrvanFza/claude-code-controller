@@ -115,14 +115,10 @@ describe("Runtime v3 progression interface", () => {
 
   it("never redispatches a queued Turn whose admission write-intent survived takeover", async () => {
     const prompt = vi.fn();
+    const authorize = vi.fn().mockResolvedValue(null);
     const advance = createRuntimeV3WarmTurnAdvance({
       persistence: {
-        authorize: vi.fn().mockResolvedValue({
-          boxId: "bx_23456789",
-          piInvocationId: "invocation-1",
-          content: "do not dispatch twice",
-          cursor: 0n,
-        }),
+        authorize,
         beginAdmission: vi.fn(),
         recordAdmission: vi.fn(),
         project: vi.fn(),
@@ -137,8 +133,187 @@ describe("Runtime v3 progression interface", () => {
       kind: "interrupted",
       code: "pi_admission_outcome_unknown",
     });
+    expect(authorize).not.toHaveBeenCalled();
     expect(prompt).not.toHaveBeenCalled();
   });
+
+  it("releases a recovery-deferred lane without contacting Pi", async () => {
+    const prompt = vi.fn();
+    const beginAdmission = vi.fn();
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1",
+          content: "wait for the reserved recovery admission", cursor: 0n,
+          recoveryDeferred: true,
+        }),
+        beginAdmission, recordAdmission: vi.fn(), project: vi.fn(),
+      },
+      pi: { prompt, read: vi.fn(), acknowledge: vi.fn() },
+    });
+
+    await expect(advance(mainClaim)).resolves.toEqual({ kind: "release" });
+    expect(beginAdmission).not.toHaveBeenCalled();
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it("releases without contacting Pi when the pre-Pi admission fence is refused", async () => {
+    const prompt = vi.fn();
+    const beginAdmission = vi.fn().mockResolvedValue(false);
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1",
+          content: "authorized before invalidation", cursor: 0n,
+        }),
+        beginAdmission,
+        recordAdmission: vi.fn(),
+        project: vi.fn(),
+      },
+      pi: { prompt, read: vi.fn(), acknowledge: vi.fn() },
+    });
+
+    await expect(advance(mainClaim)).resolves.toEqual({ kind: "release" });
+    expect(beginAdmission).toHaveBeenCalledOnce();
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it("hands off an authorization reservation whose committed response is lost", async () => {
+    const prompt = vi.fn();
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn(async () => {
+          throw new Error("authorization response lost after reservation");
+        }),
+        beginAdmission: vi.fn(), recordAdmission: vi.fn(), project: vi.fn(),
+      },
+      pi: { prompt, read: vi.fn(), acknowledge: vi.fn() },
+    });
+
+    await expect(advance(mainClaim)).resolves.toEqual({ kind: "release" });
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it("hands off a committed pre-Pi fence when shutdown arrives before prompt", async () => {
+    const controller = new AbortController();
+    const prompt = vi.fn();
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1",
+          content: "fenced before shutdown", cursor: 0n,
+        }),
+        beginAdmission: vi.fn(async () => {
+          controller.abort();
+          return true;
+        }),
+        recordAdmission: vi.fn(), project: vi.fn(),
+      },
+      pi: { prompt, read: vi.fn(), acknowledge: vi.fn() },
+    });
+
+    await expect(advance(mainClaim, controller.signal)).resolves.toEqual({ kind: "release" });
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it("hands off after a positive admission record commits as shutdown arrives", async () => {
+    const controller = new AbortController();
+    const prompt = vi.fn().mockResolvedValue({
+      outcome: "accepted" as const, invocationId: "invocation-1", initialCursor: 0n,
+    });
+    const project = vi.fn();
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1",
+          content: "record before shutdown", cursor: 0n,
+        }),
+        beginAdmission: vi.fn().mockResolvedValue(true),
+        recordAdmission: vi.fn(async () => {
+          controller.abort();
+          return true;
+        }),
+        project,
+      },
+      pi: { prompt, read: vi.fn(), acknowledge: vi.fn() },
+    });
+
+    await expect(advance(mainClaim, controller.signal)).resolves.toEqual({ kind: "release" });
+    expect(prompt).toHaveBeenCalledOnce();
+    expect(project).not.toHaveBeenCalled();
+  });
+
+  it("keeps a proven prompt refusal queued when shutdown arrives with the response", async () => {
+    const controller = new AbortController();
+    const recordAdmission = vi.fn();
+    const prompt = vi.fn(async () => {
+      controller.abort();
+      return { outcome: "rejected" as const, code: "pi_prompt_refused" };
+    });
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1",
+          content: "refuse before shutdown", cursor: 0n,
+        }),
+        beginAdmission: vi.fn().mockResolvedValue(true), recordAdmission,
+        project: vi.fn(),
+      },
+      pi: { prompt, read: vi.fn(), acknowledge: vi.fn() },
+    });
+
+    await expect(advance(mainClaim, controller.signal)).resolves.toEqual({ kind: "release" });
+    expect(prompt).toHaveBeenCalledOnce();
+    expect(recordAdmission).not.toHaveBeenCalled();
+  });
+
+  it.each(["nonterminal", "terminal"] as const)(
+    "hands off when a %s projection may have committed before its transport failed",
+    async (projectionKind) => {
+      const events = projectionKind === "terminal"
+        ? [{
+          sequence: 1n, invocationId: "invocation-1", attemptId: acceptedTurn.id,
+          kind: "pi_event" as const,
+          event: { type: "agent_settled" as const },
+        }]
+        : [{
+          sequence: 1n, invocationId: "invocation-1", attemptId: acceptedTurn.id,
+          kind: "pi_event" as const,
+          event: { type: "message_start" as const },
+        }];
+      const project = vi.fn(async () => {
+        throw new Error("projection response lost after commit");
+      });
+      const advance = createRuntimeV3WarmTurnAdvance({
+        persistence: {
+          authorize: vi.fn().mockResolvedValue({
+            boxId: "bx_23456789", piInvocationId: "invocation-1",
+            content: "resume projection", cursor: 0n,
+          }),
+          beginAdmission: vi.fn(), recordAdmission: vi.fn(), project,
+        },
+        pi: {
+          prompt: vi.fn(),
+          read: vi.fn().mockResolvedValue({
+            events, nextCursor: 1n, acknowledgedCursor: 0n, hasMore: false,
+          }),
+          acknowledge: vi.fn(),
+        },
+      });
+      const activeClaim = {
+        ...mainClaim,
+        turn: {
+          ...acceptedTurn,
+          state: "admitted" as const,
+          inactivityDeadlineAt: new Date(Date.now() + 60_000),
+          absoluteDeadlineAt: new Date(Date.now() + 120_000),
+        },
+      };
+
+      await expect(advance(activeClaim)).resolves.toEqual({ kind: "release" });
+      expect(project).toHaveBeenCalledOnce();
+    },
+  );
 
   it("preserves needs-input across unknown pages until correlated activity resumes it", async () => {
     const project = vi.fn().mockResolvedValue(true);
@@ -415,6 +590,63 @@ describe("Runtime v3 progression interface", () => {
       }),
       { next: "prepared", piInvocationId: "pi-1" },
     ]);
+  });
+
+  it("recycles only the exactly fenced Pi on the same Box before restaging", async () => {
+    const base: RuntimeV3PreparationClaim = {
+      orgId: mainClaim.orgId,
+      companionId: mainClaim.companionId,
+      turnId: acceptedTurn.id,
+      commandId: acceptedTurn.commandId,
+      checkpoint: "box_ready",
+      piRecycleCheckpoint: "terminate",
+      recyclePiInvocationId: "pi-contaminated",
+      recoveryId: acceptedTurn.id,
+      recoveryContext: "durable context",
+      boxIdempotencyKey: "11111111-1111-4111-8111-111111111111",
+      boxId: "bx_23456789",
+      createdAt: new Date(), executorId: "runtime-heal", authorized: true,
+      actorId: "actor-1", modelId: "claude-test", persona: null,
+      settingsRevision: 1n, skillsRevision: 1,
+      providerRefs: [], skillRefs: [], mcpRefs: [], providerMaterial: [],
+      skillMaterial: [], mcpMaterial: [], configCatalog: null, fence: mainClaim.fence,
+    };
+    const claims: RuntimeV3PreparationClaim[] = [
+      base,
+      { ...base, piRecycleCheckpoint: "reset" },
+      { ...base, piRecycleCheckpoint: "ready" },
+      { ...base, checkpoint: "staged", piRecycleCheckpoint: "ready" },
+    ];
+    const terminatePiInvocation = vi.fn().mockResolvedValue({ outcome: "terminated" });
+    const resetPiSession = vi.fn().mockResolvedValue(undefined);
+    const checkpointPiRecycle = vi.fn().mockResolvedValue(true);
+    const stagePreparation = vi.fn().mockResolvedValue({
+      diskLayoutVersion: 14, appliedSettingsRevision: 1n, appliedSkillsRevision: 1,
+      skillsDigest: "b".repeat(64), materialExpiresAt: new Date(Date.now() + 8 * 60 * 60_000),
+    });
+    const startPiDaemon = vi.fn().mockResolvedValue({ state: "idle", invocationId: "pi-fresh" });
+    const preparation = createRuntimeV3Preparation({
+      persistence: {
+        claim: vi.fn(async () => claims.shift() ?? null), checkpoint: vi.fn().mockResolvedValue(true),
+        checkpointPiRecycle, defer: vi.fn().mockResolvedValue(true),
+        reauthorize: vi.fn().mockResolvedValue(true), mintCredentials: vi.fn(),
+      },
+      box: { createGenerationBox: vi.fn(), applyGenerationBoxSettings: vi.fn(), getStatus: vi.fn() },
+      preparationStager: { stagePreparation },
+      pi: { terminatePiInvocation, resetPiSession, startPiDaemon },
+    });
+
+    await expect(preparation.converge({ executorId: "runtime-heal" }))
+      .resolves.toEqual({ progressed: 4, exhausted: false });
+    expect(terminatePiInvocation).toHaveBeenCalledWith(expect.objectContaining({
+      boxId: "bx_23456789", expectedInvocationId: "pi-contaminated",
+    }));
+    expect(resetPiSession).toHaveBeenCalledWith(expect.objectContaining({
+      boxId: "bx_23456789", recoveryId: acceptedTurn.id,
+    }));
+    expect(checkpointPiRecycle.mock.calls.map(([, next]) => next)).toEqual(["reset", "complete"]);
+    expect(stagePreparation).toHaveBeenCalledTimes(1);
+    expect(startPiDaemon).toHaveBeenCalledTimes(1);
   });
 
   it.each(["provider", "staging"] as const)(
