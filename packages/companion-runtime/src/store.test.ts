@@ -3,6 +3,7 @@
 import { describe, expect, it } from "vitest";
 import {
   PostgresRuntimeStore,
+  RuntimeAttachmentExpiredError,
   RuntimeCredentialSnapshotChangedError,
   type RuntimeSqlClient,
   type RuntimeSqlRow,
@@ -69,6 +70,19 @@ const fence: LeaseFence = {
 };
 
 describe("PostgresRuntimeStore", () => {
+  it("maps the database expiry guard to a stable non-retryable runtime failure", async () => {
+    const sql: RuntimeSqlClient = {
+      unsafe: async () => { throw { code: "P5220" }; },
+    };
+    const store = new PostgresRuntimeStore(sql);
+
+    await expect(store.getMaterial({
+      ...fence,
+      workKind: "attempt",
+      workId: ATTEMPT_ID,
+    }, 30)).rejects.toBeInstanceOf(RuntimeAttachmentExpiredError);
+  });
+
   it("reads only aggregate self-heal telemetry through the narrow runtime function", async () => {
     const sql = new RecordingSql();
     sql.rows = [{
@@ -190,6 +204,7 @@ describe("PostgresRuntimeStore", () => {
         sha256: "a".repeat(64),
         filename: "chart.png",
         position: 0,
+        expires_at: "2026-09-25T00:00:00.000Z",
       }],
       credential_snapshot_matches: true,
       box_id: "bx_2345678a",
@@ -207,7 +222,12 @@ describe("PostgresRuntimeStore", () => {
       turnStartedAt: new Date("2026-08-26T13:42:17.000Z"),
       memberTimezone: "America/New_York",
       hasVisibleOutput: true,
-      attachments: [{ filename: "chart.png", contentType: "image/png", position: 0 }],
+      attachments: [{
+        filename: "chart.png",
+        contentType: "image/png",
+        position: 0,
+        expiresAt: new Date("2026-09-25T00:00:00.000Z"),
+      }],
       boxId: "bx_2345678a",
       agentEndpoint: null,
     });
@@ -413,6 +433,7 @@ describe("PostgresRuntimeStore", () => {
           byteSize: 512,
           sha256: "d".repeat(64),
           filename: "plot.png",
+          uploadedAt: new Date("2026-08-18T11:59:57.000Z"),
         }],
         activityAt: new Date("2026-08-18T12:00:00.000Z"),
       },
@@ -429,6 +450,7 @@ describe("PostgresRuntimeStore", () => {
       content_type: "image/png",
       byte_size: 512,
       position: 0,
+      uploaded_at: "2026-08-18T11:59:57.000Z",
     })]);
   });
 

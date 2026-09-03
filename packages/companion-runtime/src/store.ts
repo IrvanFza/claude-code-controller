@@ -186,6 +186,16 @@ export class RuntimeCredentialSnapshotChangedError extends Error {
   }
 }
 
+export class RuntimeAttachmentExpiredError extends Error {
+  readonly stableCode = "attachment_expired";
+  readonly action = "none" as const;
+
+  constructor() {
+    super("The files attached to this message have expired and must be uploaded again.");
+    this.name = "RuntimeAttachmentExpiredError";
+  }
+}
+
 /**
  * The database connection disappeared while invoking a mutating definer. The
  * transaction may have committed even though no result reached this process,
@@ -217,10 +227,12 @@ async function mapped<T>(operation: () => Promise<T>, mutating = false): Promise
       || error instanceof RuntimeStoreContractError
       || error instanceof RuntimeStoreIndeterminateError
       || error instanceof RuntimeCredentialSnapshotChangedError
+      || error instanceof RuntimeAttachmentExpiredError
       || error instanceof RuntimeRowDecodeError
     ) throw error;
     if (sqlState(error) === "40001") throw new RuntimeStoreSerializationError(error);
     if (sqlState(error) === "22023") throw new RuntimeStoreContractError();
+    if (sqlState(error) === "P5220") throw new RuntimeAttachmentExpiredError();
     if (mutating) throw new RuntimeStoreIndeterminateError(error);
     throw error;
   }
@@ -338,6 +350,8 @@ function decodeAttachments(row: RuntimeSqlRow): RuntimeAttachment[] {
     const contentType = nullableText(attachment, "content_type");
     const sha256 = nullableText(attachment, "sha256");
     const filename = nullableText(attachment, "filename");
+    const expiresAtText = nullableText(attachment, "expires_at");
+    const expiresAt = expiresAtText === null ? null : new Date(expiresAtText);
     const byteSize = numberValue(attachment.byte_size);
     const position = numberValue(attachment.position);
     if (
@@ -350,6 +364,8 @@ function decodeAttachments(row: RuntimeSqlRow): RuntimeAttachment[] {
       || !SHA256_PATTERN.test(sha256)
       || filename === null
       || !COMPANION_ATTACHMENT_FILENAME_PATTERN.test(filename)
+      || expiresAt === null
+      || !Number.isFinite(expiresAt.getTime())
       || byteSize === null
       || byteSize < 1
       || byteSize > COMPANION_ATTACHMENT_MAX_BYTES
@@ -363,6 +379,7 @@ function decodeAttachments(row: RuntimeSqlRow): RuntimeAttachment[] {
       sha256,
       filename,
       position: index,
+      expiresAt,
     };
   });
 }
@@ -1207,6 +1224,7 @@ export class PostgresRuntimeStore implements RuntimeStore {
         sha256: attachment.sha256,
         filename: attachment.filename,
         position,
+        uploaded_at: attachment.uploadedAt.toISOString(),
       }));
       const rows = await this.sql.unsafe<RuntimeSqlRow[]>(`
         SELECT recorded, has_visible_output

@@ -430,6 +430,8 @@ export interface RuntimeAttachment {
   sha256: string;
   filename: string;
   position: number;
+  /** Immutable storage deadline, rechecked immediately before every external staging boundary. */
+  expiresAt: Date;
 }
 
 /** Sensitive values remain opaque to this package and are never included in errors or health. */
@@ -528,6 +530,8 @@ export interface RuntimeOutputAttachment {
   byteSize: number;
   sha256: string;
   filename: string;
+  /** Object-store upload completion, which alone anchors the immutable retention deadline. */
+  uploadedAt: Date;
 }
 
 export const DUPLICATE_CLEANUP_STATUSES = [

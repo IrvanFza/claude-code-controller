@@ -75,6 +75,7 @@ function attachment(bytes: Buffer, position = 0) {
     sha256: digest(bytes),
     filename: `chart-${position}.png`,
     position,
+    expiresAt: new Date("2026-09-25T00:00:00.000Z"),
   };
 }
 
@@ -187,6 +188,131 @@ describe("staging a member's attachments onto the Box", () => {
     }).attachmentStager.stageAttachments(stageInput([attachment(PNG)]))).rejects.toThrow();
     expect(stageAttachments).not.toHaveBeenCalled();
   });
+
+  it("rechecks the immutable deadline after object read and before Box staging", async () => {
+    let clock = Date.parse("2026-09-24T23:59:59.000Z");
+    const stageAttachments = vi.fn();
+    const loadAttachment = vi.fn(async () => {
+      clock = Date.parse("2026-09-25T00:00:00.000Z");
+      return PNG;
+    });
+
+    await expect(pipeline({
+      runtime: { stageAttachments },
+      loadAttachment,
+      now: () => clock,
+    }).attachmentStager.stageAttachments(stageInput([attachment(PNG)])))
+      .rejects.toMatchObject({ stableCode: "attachment_expired" });
+    expect(stageAttachments).toHaveBeenCalledTimes(1);
+    expect(stageAttachments).toHaveBeenCalledWith(expect.objectContaining({ files: [] }));
+  });
+
+  it("does not expose staged paths when expiry crosses during the Box write", async () => {
+    let clock = Date.parse("2026-09-24T23:59:59.000Z");
+    const stageAttachments = vi.fn(async (input: { files: unknown[] }) => {
+      if (input.files.length === 0) return [];
+      clock = Date.parse("2026-09-25T00:00:00.000Z");
+      return [{
+        position: 0,
+        filename: "chart-0.png",
+        contentType: "image/png",
+        byteSize: PNG.byteLength,
+        path: "~/attachments/message/0-chart-0.png",
+      }];
+    });
+
+    await expect(pipeline({
+      runtime: { stageAttachments },
+      now: () => clock,
+    }).attachmentStager.stageAttachments(stageInput([attachment(PNG)])))
+      .rejects.toMatchObject({ stableCode: "attachment_expired" });
+    expect(stageAttachments).toHaveBeenCalledTimes(2);
+    expect(stageAttachments).toHaveBeenLastCalledWith(expect.objectContaining({ files: [] }));
+  });
+
+  it("keeps a failed expiry cleanup retryable without exposing paths", async () => {
+    let clock = Date.parse("2026-09-24T23:59:59.000Z");
+    const retryable = Object.assign(new Error("Box cleanup unavailable"), {
+      retryable: true,
+    });
+    const stageAttachments = vi.fn(async (input: { files: unknown[] }) => {
+      if (input.files.length === 0) throw retryable;
+      clock = Date.parse("2026-09-25T00:00:00.000Z");
+      return [];
+    });
+
+    await expect(pipeline({
+      runtime: { stageAttachments },
+      now: () => clock,
+    }).attachmentStager.stageAttachments(stageInput([attachment(PNG)]))).rejects.toBe(retryable);
+    expect(stageAttachments).toHaveBeenCalledTimes(2);
+    expect(stageAttachments).toHaveBeenLastCalledWith(expect.objectContaining({ files: [] }));
+  });
+
+  it("clears expired staging even when the attempt is cancelled during the Box write", async () => {
+    let clock = Date.parse("2026-09-24T23:59:59.000Z");
+    const controller = new AbortController();
+    const stageAttachments = vi.fn(async (input: { files: unknown[]; signal?: AbortSignal }) => {
+      if (input.files.length === 0) {
+        expect(input.signal?.aborted).toBe(false);
+        return [];
+      }
+      clock = Date.parse("2026-09-25T00:00:00.000Z");
+      controller.abort();
+      return [{
+        position: 0,
+        filename: "chart-0.png",
+        contentType: "image/png",
+        byteSize: PNG.byteLength,
+        path: "~/attachments/message/0-chart-0.png",
+      }];
+    });
+
+    await expect(pipeline({
+      runtime: { stageAttachments },
+      now: () => clock,
+    }).attachmentStager.stageAttachments({
+      ...stageInput([attachment(PNG)]),
+      signal: controller.signal,
+    })).rejects.toMatchObject({ stableCode: "attachment_expired" });
+    expect(stageAttachments).toHaveBeenCalledTimes(2);
+    expect(stageAttachments).toHaveBeenLastCalledWith(expect.objectContaining({
+      boxId: "bx_23456789",
+      messageId: "44444444-4444-4444-8444-444444444444",
+      files: [],
+      signal: expect.objectContaining({ aborted: false }),
+    }));
+  });
+
+  it("clears expired staging when a cancelled Box write rejects after persisting bytes", async () => {
+    let clock = Date.parse("2026-09-24T23:59:59.000Z");
+    const controller = new AbortController();
+    const cancellation = new Error("staging cancelled");
+    const stageAttachments = vi.fn(async (input: { files: unknown[]; signal?: AbortSignal }) => {
+      if (input.files.length === 0) {
+        expect(input.signal?.aborted).toBe(false);
+        return [];
+      }
+      clock = Date.parse("2026-09-25T00:00:00.000Z");
+      controller.abort(cancellation);
+      throw controller.signal.reason;
+    });
+
+    await expect(pipeline({
+      runtime: { stageAttachments },
+      now: () => clock,
+    }).attachmentStager.stageAttachments({
+      ...stageInput([attachment(PNG)]),
+      signal: controller.signal,
+    })).rejects.toBe(cancellation);
+    expect(stageAttachments).toHaveBeenCalledTimes(2);
+    expect(stageAttachments).toHaveBeenLastCalledWith(expect.objectContaining({
+      boxId: "bx_23456789",
+      messageId: "44444444-4444-4444-8444-444444444444",
+      files: [],
+      signal: expect.objectContaining({ aborted: false }),
+    }));
+  });
 });
 
 describe("harvesting Pi's outbox", () => {
@@ -202,9 +328,14 @@ describe("harvesting Pi's outbox", () => {
 
   it("stores each image under its content address and reports a complete harvest", async () => {
     const stored: string[] = [];
+    let clock = Date.parse("2026-08-26T14:00:00.000Z");
     const result = await pipeline({
       runtime: harvestRuntime([outboxEntry("plot.png", PNG)]),
-      storeAttachment: async ({ key }) => { stored.push(key); },
+      storeAttachment: async ({ key }) => {
+        stored.push(key);
+        clock = Date.parse("2026-08-26T14:00:03.000Z");
+      },
+      now: () => clock,
     }).outboxHarvester.harvestOutbox(harvestInput());
 
     expect(result.incomplete).toBe(false);
@@ -213,6 +344,7 @@ describe("harvesting Pi's outbox", () => {
       byteSize: PNG.byteLength,
       sha256: digest(PNG),
       filename: "plot.png",
+      uploadedAt: new Date("2026-08-26T14:00:03.000Z"),
     })]);
     expect(stored).toEqual([
       `companion-attachments/${orgId}/${companionId}/outputs/${attemptId}/0-${digest(PNG)}`,

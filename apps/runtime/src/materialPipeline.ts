@@ -9,6 +9,7 @@ import {
 } from "@companion/box-runtime";
 import {
   RUNTIME_LEASE_SECONDS,
+  RuntimeAttachmentExpiredError,
   createRuntimeVisibleTextRedactor,
   type RuntimeAttachmentStager,
   type RuntimeMaterialProvider,
@@ -404,8 +405,29 @@ export function createRuntimeMaterialPipeline(input: {
   };
   const attachmentStager: RuntimeAttachmentStager = {
     async stageAttachments(stage) {
+      const fileRuntime = input.fileRuntime?.() ?? input.runtime();
+      const messageId = messageIdFromEventId(stage.messageEventId);
+      const clearStaging = async (): Promise<void> => {
+        // The staging contract replaces the whole scratch root. Let provider failures propagate:
+        // the engine classifies them as retryable staging failures, and the next attempt starts by
+        // retrying this empty replacement without reading or writing attachment bytes. Retention
+        // cleanup must outlive cancellation of the attempt whose Box write crossed the deadline.
+        await fileRuntime.stageAttachments({
+          boxId: stage.boxId,
+          messageId,
+          files: [],
+          signal: AbortSignal.timeout(30_000),
+        });
+      };
+      const clearExpiredStaging = async (): Promise<never> => {
+        await clearStaging();
+        throw new RuntimeAttachmentExpiredError();
+      };
       const files = [];
       for (const attachment of stage.material.attachments) {
+        if (now() >= attachment.expiresAt.getTime()) {
+          await clearExpiredStaging();
+        }
         const bytes = await input.loadAttachment(attachment.storageKey, stage.signal);
         // The digest is checked against what the control plane accepted, not against what object
         // storage happened to return. A truncated read, a rewritten object, or the wrong key all
@@ -413,6 +435,9 @@ export function createRuntimeMaterialPipeline(input: {
         const digest = createHash("sha256").update(bytes).digest("hex");
         if (bytes.byteLength !== attachment.byteSize || digest !== attachment.sha256) {
           throw new RuntimeMaterialError("runtime_material_invalid");
+        }
+        if (now() >= attachment.expiresAt.getTime()) {
+          await clearExpiredStaging();
         }
         files.push({
           position: attachment.position,
@@ -428,12 +453,31 @@ export function createRuntimeMaterialPipeline(input: {
         material: stage.material,
         authorization: stage.authorization,
       });
-      return await (input.fileRuntime?.() ?? input.runtime()).stageAttachments({
-        boxId: stage.boxId,
-        messageId: messageIdFromEventId(stage.messageEventId),
-        files,
-        signal: stage.signal,
-      });
+      if (stage.material.attachments.some((attachment) => now() >= attachment.expiresAt.getTime())) {
+        await clearExpiredStaging();
+      }
+      let staged;
+      try {
+        staged = await fileRuntime.stageAttachments({
+          boxId: stage.boxId,
+          messageId,
+          files,
+          signal: stage.signal,
+        });
+      } catch (error) {
+        // A cancelled provider call may reject after writing part or all of the scratch root. Clear
+        // it with the independent retention signal before preserving the original staging error; a
+        // cleanup failure intentionally takes precedence so the engine can retry the cleanup.
+        await clearStaging();
+        throw error;
+      }
+      // The existing idempotent staging seam replaces the whole scratch root. If the deadline
+      // crosses during the Box write, immediately replace it with an empty staging set before
+      // withholding paths from the engine, so neither disk bytes nor a Pi-visible prompt survive.
+      if (stage.material.attachments.some((attachment) => now() >= attachment.expiresAt.getTime())) {
+        await clearExpiredStaging();
+      }
+      return staged;
     },
   };
   const outboxHarvester: RuntimeOutboxHarvester = {
@@ -498,6 +542,7 @@ export function createRuntimeMaterialPipeline(input: {
             contentType,
             signal: harvest.signal,
           });
+          const uploadedAt = new Date(now());
           total += file.bytes.byteLength;
           attachments.push({
             storageKey: key,
@@ -509,6 +554,7 @@ export function createRuntimeMaterialPipeline(input: {
               position: attachments.length,
               contentType,
             }),
+            uploadedAt,
           });
         } catch {
           incomplete = true;
