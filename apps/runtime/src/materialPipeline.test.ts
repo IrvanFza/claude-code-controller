@@ -5,12 +5,20 @@ import {
   encryptOpaqueValue,
 } from "@companion/core";
 import {
+  RuntimeExternalDependencyError,
   type LeaseFence,
   type RuntimeAuthorization,
   type RuntimeStore,
   type RuntimeWorkMaterial,
 } from "@companion/companion-runtime";
-import type { CompanionBoxRuntimeV2 } from "@companion/box-runtime";
+import {
+  createRuntimeV3Preparation,
+  type RuntimeV3PreparationClaim,
+} from "@companion/companion-runtime/v3/internal";
+import {
+  BoxRuntimeProviderError,
+  type CompanionBoxRuntimeV2,
+} from "@companion/box-runtime";
 
 import { companionHubApiUrl, createRuntimeMaterialPipeline } from "./materialPipeline";
 import { RuntimeMaterialError } from "./resourceMaterial";
@@ -636,7 +644,214 @@ describe("runtime material provider and Box stager", () => {
     expect(loadSkillArchive).not.toHaveBeenCalled();
     expect(stageExistingBox).not.toHaveBeenCalled();
   });
+
+  it("attributes a failed preparation credential mint to the exact authority grant", async () => {
+    const stageExistingBox = vi.fn();
+    const pipeline = createRuntimeMaterialPipeline({
+      masterKey,
+      apiUrl: "https://api.example.test",
+      bundledSkill: {
+        slug: "companion",
+        version: "1.0.0",
+        checksum: `sha256:${"1".repeat(64)}`,
+        archive: Buffer.from("bundled"),
+      },
+      runtime: () => fakeRuntime(stageExistingBox),
+      loadSkillArchive: vi.fn(),
+      loadAttachment: vi.fn(),
+      storeAttachment: vi.fn(),
+    });
+    const claim = preparationClaim();
+
+    await expect(pipeline.preparationStager.stagePreparation({
+      claim,
+      authorize: async () => null,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({
+      name: "RuntimeExternalDependencyError",
+      failureClass: "authority",
+      dependency: { kind: "grant", id: `actor:${accountId}` },
+    } satisfies Partial<RuntimeExternalDependencyError>);
+    expect(stageExistingBox).not.toHaveBeenCalled();
+  });
+
+  it("preserves deterministic Box conflicts while classifying provider failures as outages", async () => {
+    const conflict = new BoxRuntimeProviderError(
+      "The durable Box identity does not match this Companion",
+      409,
+    );
+    const invalidSnapshot = new BoxRuntimeProviderError("Invalid staged snapshot", 422);
+    const providerFailure = new BoxRuntimeProviderError("Box API is unavailable", 502);
+    const stageExistingBox = vi.fn()
+      .mockRejectedValueOnce(conflict)
+      .mockRejectedValueOnce(invalidSnapshot)
+      .mockRejectedValueOnce(providerFailure);
+    const pipeline = createRuntimeMaterialPipeline({
+      masterKey,
+      apiUrl: "https://api.example.test",
+      bundledSkill: {
+        slug: "companion",
+        version: "1.0.0",
+        checksum: `sha256:${"1".repeat(64)}`,
+        archive: Buffer.from("bundled"),
+      },
+      runtime: () => fakeRuntime(stageExistingBox),
+      loadSkillArchive: vi.fn(),
+      loadAttachment: vi.fn(),
+      storeAttachment: vi.fn(),
+    });
+
+    await expect(pipeline.preparationStager.stagePreparation({
+      claim: preparationClaim(),
+      authorize: async () => ({
+        hubToken: "hub-token",
+        mcpBrokerToken: null,
+        controlToken: "control-token",
+        expiresAt: new Date("2027-01-01T00:00:00.000Z"),
+      }),
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({
+      name: "RuntimeTerminalPreparationError",
+      error: {
+        code: "box_staging_conflict",
+        message: "The Companion Box rejected its runtime material.",
+        action: "none",
+      },
+    });
+
+    await expect(pipeline.preparationStager.stagePreparation({
+      claim: preparationClaim(),
+      authorize: async () => ({
+        hubToken: "hub-token",
+        mcpBrokerToken: null,
+        controlToken: "control-token",
+        expiresAt: new Date("2027-01-01T00:00:00.000Z"),
+      }),
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({
+      name: "RuntimeTerminalPreparationError",
+      error: { code: "box_staging_conflict", action: "none" },
+    });
+
+    await expect(pipeline.preparationStager.stagePreparation({
+      claim: preparationClaim(),
+      authorize: async () => ({
+        hubToken: "hub-token",
+        mcpBrokerToken: null,
+        controlToken: "control-token",
+        expiresAt: new Date("2027-01-01T00:00:00.000Z"),
+      }),
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({
+      name: "RuntimeExternalDependencyError",
+      failureClass: "box",
+      dependency: { kind: "box", id: "bx_23456789" },
+    } satisfies Partial<RuntimeExternalDependencyError>);
+  });
+
+  it.each([
+    [409, "terminal"],
+    [422, "terminal"],
+    [408, "external"],
+    [429, "external"],
+    [500, "external"],
+    [503, "external"],
+  ] as const)("settles Box status %i through preparation as %s", async (status, outcome) => {
+    const stageExistingBox = vi.fn(async () => {
+      throw new BoxRuntimeProviderError("provider-controlled detail", status);
+    });
+    const pipeline = createRuntimeMaterialPipeline({
+      masterKey,
+      apiUrl: "https://api.example.test",
+      bundledSkill: {
+        slug: "companion",
+        version: "1.0.0",
+        checksum: `sha256:${"1".repeat(64)}`,
+        archive: Buffer.from("bundled"),
+      },
+      runtime: () => fakeRuntime(stageExistingBox),
+      loadSkillArchive: vi.fn(),
+      loadAttachment: vi.fn(),
+      storeAttachment: vi.fn(),
+    });
+    const claim = preparationClaim();
+    const defer = vi.fn().mockResolvedValue(true);
+    const fail = vi.fn().mockResolvedValue(true);
+    const persistence = {
+      claim: vi.fn().mockResolvedValueOnce(claim),
+      checkpoint: vi.fn().mockResolvedValue(true),
+      defer,
+      fail,
+      reauthorize: vi.fn().mockResolvedValue(true),
+      mintCredentials: vi.fn().mockResolvedValue({
+        hubToken: "hub-token",
+        mcpBrokerToken: null,
+        controlToken: "control-token",
+        expiresAt: new Date("2027-01-01T00:00:00.000Z"),
+      }),
+    };
+    const preparation = createRuntimeV3Preparation({
+      persistence,
+      box: {
+        createGenerationBox: vi.fn(),
+        applyGenerationBoxSettings: vi.fn(),
+        getStatus: vi.fn(),
+      },
+      preparationStager: pipeline.preparationStager,
+      pi: { startPiDaemon: vi.fn() },
+      jitter: () => 0.5,
+    });
+
+    await preparation.converge({ executorId: claim.executorId });
+
+    if (outcome === "terminal") {
+      expect(fail).toHaveBeenCalledWith(claim, {
+        error: {
+          code: "box_staging_conflict",
+          message: "The Companion Box rejected its runtime material.",
+          action: "none",
+        },
+      }, expect.any(AbortSignal));
+      expect(defer).not.toHaveBeenCalled();
+    } else {
+      expect(fail).not.toHaveBeenCalled();
+      expect(defer).toHaveBeenCalledWith(claim, expect.objectContaining({
+        delaySeconds: 5,
+        error: expect.objectContaining({ code: "box_unavailable", action: "retry" }),
+        externalFailureClass: "box",
+        dependencyKey: "box:companion",
+      }), expect.any(AbortSignal));
+    }
+  });
 });
+
+function preparationClaim(): RuntimeV3PreparationClaim {
+  return {
+    executorId: "runtime-test",
+    orgId,
+    companionId,
+    turnId: "66666666-6666-4666-8666-666666666666",
+    commandId: "77777777-7777-4777-8777-777777777777",
+    checkpoint: "box_ready",
+    boxIdempotencyKey: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    boxId: "bx_23456789",
+    createdAt: new Date("2026-09-03T00:00:00.000Z"),
+    authorized: true,
+    actorId: accountId,
+    modelId: "claude-test",
+    persona: "test",
+    settingsRevision: 3n,
+    skillsRevision: 4,
+    providerRefs: [],
+    skillRefs: [],
+    mcpRefs: [],
+    providerMaterial: [],
+    skillMaterial: [],
+    mcpMaterial: [],
+    configCatalog: null,
+    fence: { token: generation, epoch: 1n, gateEpoch: 1n },
+  };
+}
 
 function fakeEncryptedEnvelope() {
   return {

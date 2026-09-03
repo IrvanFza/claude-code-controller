@@ -727,6 +727,7 @@ function directPromptOutcome(input: {
   responseAttemptId?: string;
   initialCursor?: number;
   code?: string;
+  dependency?: { kind: "provider" | "grant"; id: string };
 }): Awaited<ReturnType<RuntimePiControl["prompt"]>> {
   if (
     input.outcome === "accepted"
@@ -745,9 +746,15 @@ function directPromptOutcome(input: {
     return accepted;
   }
   const code = input.code ?? "prompt_dispatch_unresolved";
-  return input.outcome === "refused"
-    ? { outcome: "rejected", code }
-    : { outcome: "ambiguous", code };
+  if (input.outcome === "refused") {
+    const rejected: Awaited<ReturnType<RuntimePiControl["prompt"]>> = {
+      outcome: "rejected",
+      code,
+    };
+    if (input.dependency) rejected.dependency = input.dependency;
+    return rejected;
+  }
+  return { outcome: "ambiguous", code };
 }
 
 function directWriteOutcome(input: {

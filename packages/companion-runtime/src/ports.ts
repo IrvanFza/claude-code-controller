@@ -13,6 +13,7 @@ import type {
   PiObservedState,
   RuntimeAuthorization,
   RuntimeOutputAttachment,
+  SafeRuntimeError,
   RuntimeSkillUpdateMaterial,
   RuntimeWorkMaterial,
 } from "./types";
@@ -94,6 +95,41 @@ export type BrokerWriteOutcome =
   | { outcome: "rejected"; code: string }
   | { outcome: "ambiguous"; code: string };
 
+export const RUNTIME_EXTERNAL_DEPENDENCY_KINDS = ["box", "model", "provider", "grant"] as const;
+export type RuntimeExternalDependencyKind = (typeof RUNTIME_EXTERNAL_DEPENDENCY_KINDS)[number];
+
+/** Exact causal identity carried in memory only; persistence hashes the resulting key. */
+export interface RuntimeExternalDependencyIdentity {
+  kind: RuntimeExternalDependencyKind;
+  id: string;
+}
+
+/** Typed preparation failure which preserves the provider/grant that actually failed. */
+export class RuntimeExternalDependencyError extends Error {
+  readonly failureClass: "box" | "model" | "plugin_provider" | "authority";
+
+  constructor(
+    readonly code: string,
+    readonly dependency: RuntimeExternalDependencyIdentity,
+  ) {
+    super(code);
+    this.name = "RuntimeExternalDependencyError";
+    this.failureClass = dependency.kind === "provider"
+      ? "plugin_provider"
+      : dependency.kind === "grant"
+        ? "authority"
+        : dependency.kind;
+  }
+}
+
+/** Typed deterministic preparation failure which must settle instead of entering retry backoff. */
+export class RuntimeTerminalPreparationError extends Error {
+  constructor(readonly error: SafeRuntimeError) {
+    super(error.message);
+    this.name = "RuntimeTerminalPreparationError";
+  }
+}
+
 export type BrokerPromptWriteOutcome =
   | {
     outcome: "accepted";
@@ -101,7 +137,7 @@ export type BrokerPromptWriteOutcome =
     responseAttemptId?: string;
     initialCursor: bigint;
   }
-  | { outcome: "rejected"; code: string }
+  | { outcome: "rejected"; code: string; dependency?: RuntimeExternalDependencyIdentity }
   | { outcome: "ambiguous"; code: string };
 
 /**

@@ -1124,6 +1124,23 @@ BEGIN
     END IF;
 
     IF pg_catalog.to_regprocedure(
+      'public.companion_v3_runtime_defer_external_v9(uuid,uuid,public.companion_v3_lane,uuid,uuid,bigint,bigint,public.companion_v3_external_failure_class,public.companion_v3_work_source,text,text,text,double precision,integer)'
+    ) IS NOT NULL THEN
+      companion_runtime_functions := companion_runtime_functions || ARRAY[
+        'public.companion_v3_runtime_claim_background_v9(text,public.companion_v3_lane,integer,integer)'::regprocedure,
+        'public.companion_v3_runtime_claim_warm_v9(text,public.companion_v3_lane,integer,integer)'::regprocedure,
+        'public.companion_v3_runtime_defer_external_v9(uuid,uuid,public.companion_v3_lane,uuid,uuid,bigint,bigint,public.companion_v3_external_failure_class,public.companion_v3_work_source,text,text,text,double precision,integer)'::regprocedure,
+        'public.companion_v3_runtime_defer_preparation_external_v9(uuid,uuid,uuid,uuid,bigint,bigint,public.companion_v3_external_failure_class,text,text,text,integer,integer)'::regprocedure,
+        'public.companion_v3_runtime_fail_preparation_v9(uuid,uuid,uuid,uuid,bigint,bigint,text,text,public.companion_runtime_error_action,integer)'::regprocedure,
+        'public.companion_v3_runtime_recover_external_v9(uuid,uuid,public.companion_v3_external_failure_class,text,integer)'::regprocedure,
+        'public.companion_v3_runtime_recover_external_turn_v9(uuid,uuid,uuid,integer)'::regprocedure,
+        'public.companion_v3_runtime_claim_external_incident_signal_v9(text,integer,integer)'::regprocedure,
+        'public.companion_v3_runtime_ack_external_incident_signal_v9(uuid,uuid,bigint,integer)'::regprocedure,
+        'public.companion_v3_runtime_external_incident_facts_v9(timestamp with time zone,timestamp with time zone,integer)'::regprocedure
+      ];
+    END IF;
+
+    IF pg_catalog.to_regprocedure(
       'public.companion_v3_runtime_pending_delegation_cancel(uuid,uuid,uuid,uuid,bigint,bigint,integer)'
     ) IS NOT NULL THEN
       companion_runtime_functions := companion_runtime_functions || ARRAY[

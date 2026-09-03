@@ -131,6 +131,7 @@ export const COMPANION_RUNTIME_V3_BUDGETS = {
   heartbeatSettlementMs: 2 * 60_000,
   preparationDeadlineMs: 135 * 60_000,
   preparationRetrySeconds: [5, 15, 30, 60, 300],
+  externalIncidentRetrySeconds: [5, 15, 30, 60, 300],
 } as const;
 
 if (
@@ -238,6 +239,8 @@ export const COMPANION_SQL_BUDGET_CONTRACT: Readonly<Record<string, readonly str
   // Prepared-material TTL guard retained by the protocol-7 routine-only compatibility selector.
   companion_v3_runtime_claim_routine_v7: ["2 hours 5 minutes"],
   companion_v3_runtime_claim_background_internal_v7: ["2 hours 5 minutes"],
+  companion_v3_runtime_defer_external_v9: ["2 hours"],
+  companion_v3_runtime_external_incident_facts_v9: ["31 days"],
   companion_v3_runtime_project_background_page_v7: ["10 minutes"],
   // COMPANION_ROUTINE_MISSED_GRACE_MS twin used by the scheduler fire fence.
   companion_fire_routine: ["10 minutes"],
