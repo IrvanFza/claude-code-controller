@@ -2908,6 +2908,329 @@ describe("Runtime v3 progression facts", () => {
     expect(terminal).toEqual([{ activeTurn: null, queuedCount: 0, isReplying: false }]);
   });
 
+  it("rejects partially populated terminal fallback checkpoints", async () => {
+    await seedPreparedV3("invocation-partial-terminal-fallback");
+    const messageId = randomUUID();
+    let turnId = "";
+    await asApi(async (sql) => {
+      const rows = await sql<Array<{ turn: { id: string } }>>`
+        select turn from public.companion_v3_api_enqueue_warm_turn(
+          ${ids.org}::uuid,${ids.companion}::uuid,${messageId}::uuid,
+          'reject a partial terminal fallback')`;
+      turnId = rows[0]!.turn.id;
+    });
+
+    await expect(ownerSql`
+      update public.companion_v3_turns set
+        terminal_assistant_fallback_cursor=1,
+        terminal_assistant_fallback_content='partial',
+        terminal_assistant_fallback_admitted_at=clock_timestamp()
+      where org_id=${ids.org}::uuid and companion_id=${ids.companion}::uuid
+        and id=${turnId}::uuid
+    `).rejects.toMatchObject({ code: "23514" });
+  });
+
+  it.each(["main", "background"] as const)(
+    "retains and idempotently promotes a cross-page terminal fallback for the %s lane",
+    async (lane) => {
+      const invocationId = `invocation-terminal-fallback-${lane}`;
+      const messageId = randomUUID();
+      await seedPreparedV3(invocationId);
+      let turnId = "";
+      if (lane === "main") {
+        await asApi(async (sql) => {
+          const rows = await sql<Array<{ turn: { id: string } }>>`
+            select turn from public.companion_v3_api_enqueue_warm_turn(
+              ${ids.org}::uuid,${ids.companion}::uuid,${messageId}::uuid,
+              'recover the documented terminal answer')`;
+          turnId = rows[0]!.turn.id;
+        });
+      } else {
+        const eventId = `msg:${messageId}`;
+        await ownerSql`insert into public.companion_threads(org_id,companion_id)
+          values(${ids.org}::uuid,${ids.companion}::uuid) on conflict do nothing`;
+        await ownerSql`with advanced as (
+          update public.companion_threads set next_ordinal=next_ordinal+1,
+            projection_sequence=projection_sequence+1,updated_at=clock_timestamp()
+          where org_id=${ids.org}::uuid and companion_id=${ids.companion}::uuid
+          returning next_ordinal-1 as ordinal,projection_sequence
+        ) insert into public.companion_transcript_entries(
+          org_id,companion_id,event_id,ordinal,projection_sequence,role,content,author_id)
+        select ${ids.org}::uuid,${ids.companion}::uuid,${eventId},ordinal,projection_sequence,
+          'user','recover the routine terminal answer',${ids.owner} from advanced`;
+        const admitted = await ownerSql<Array<{ turnId: string }>>`
+          select turn_id as "turnId" from public.companion_v3_admit_turn(
+            ${ids.org}::uuid,${ids.companion}::uuid,${messageId}::uuid,${eventId},
+            ${ids.owner},'background')`;
+        turnId = admitted[0]!.turnId;
+        await seedBackgroundRun(turnId, "Terminal fallback fixture");
+      }
+
+      const convergence = lane === "main"
+        ? createRuntimeV3PostgresWarmConvergence(runtimeSql, { enabledLanes: new Set(["main"]) })
+        : createRuntimeV3PostgresRoutineConvergence(runtimeSql);
+      const persistence = lane === "main"
+        ? createRuntimeV3PostgresWarmTurnPersistence(runtimeSql)
+        : createRuntimeV3PostgresRoutineTurnPersistence(runtimeSql);
+      const claim = await convergence.claimLane({
+        executorId: `runtime-terminal-fallback-${lane}`, lane,
+      });
+      expect(claim?.turn.id).toBe(turnId);
+      const material = await persistence.authorize(claim!);
+      expect(material).not.toBeNull();
+      await expect(persistence.beginAdmission(claim!, {
+        invocationId: material!.piInvocationId, cursor: 0n,
+      })).resolves.toBe(true);
+      await expect(persistence.recordAdmission(claim!, {
+        invocationId: material!.piInvocationId, responseTurnId: turnId, cursor: 0n,
+      })).resolves.toBe(true);
+
+      const candidatePage = {
+        throughCursor: 2n,
+        assistant: [],
+        assistantFallbacks: [
+          { sequence: 1n, source: "turn_end" as const, content: `turn fallback ${lane}` },
+          { sequence: 2n, source: "agent_end" as const, content: `agent fallback ${lane}` },
+        ],
+        terminalError: {
+          sequence: 2n,
+          code: "model_unavailable" as const,
+          message: "The selected model is unavailable. Choose a different model and try again." as const,
+          action: "switch_model" as const,
+        },
+        privateEntries: lane === "background" ? [] : undefined,
+        decisions: [],
+        routineReturns: [],
+        needsInput: false,
+        settled: false,
+        processExited: false,
+        activity: true,
+      };
+      const fallbackJson = runtimeSql.json(candidatePage.assistantFallbacks.map((fallback) => ({
+        ...fallback, sequence: fallback.sequence.toString(),
+      })));
+      for (let replay = 0; replay < 2; replay += 1) {
+        await expect(runtimeSql<Array<{ recorded: boolean }>>`
+          select public.companion_v3_runtime_record_native_fallback_v8(
+            ${claim!.orgId}::uuid,${claim!.companionId}::uuid,${lane},${turnId}::uuid,
+            ${claim!.fence.token}::uuid,${claim!.fence.epoch.toString()}::bigint,
+            ${claim!.fence.gateEpoch.toString()}::bigint,${fallbackJson}::jsonb,8) as recorded`
+        ).resolves.toEqual([{ recorded: true }]);
+      }
+      await expect(persistence.project(claim!, candidatePage)).resolves.toBe(true);
+      await expect(convergence.completeProgression(claim!, { kind: "release" }))
+        .resolves.toBe(true);
+
+      const takeover = await convergence.claimLane({
+        executorId: `runtime-terminal-fallback-takeover-${lane}`, lane,
+      });
+      expect(takeover?.turn.id).toBe(turnId);
+      await expect(persistence.project(takeover!, {
+        throughCursor: 3n,
+        assistant: [],
+        privateEntries: lane === "background" ? [] : undefined,
+        decisions: [],
+        routineReturns: [],
+        needsInput: false,
+        settled: true,
+        processExited: false,
+        activity: false,
+      })).resolves.toBe("succeeded");
+      await expect(convergence.completeProgression(takeover!, { kind: "ack_completed" }))
+        .resolves.toBe(true);
+
+      const result = lane === "main"
+        ? await ownerSql<Array<{ content: string }>>`
+          select content from public.companion_transcript_entries
+          where org_id=${ids.org}::uuid and companion_id=${ids.companion}::uuid
+            and role='assistant' and event_id like ${`v3:${turnId}:%`}`
+        : await ownerSql<Array<{ content: string }>>`
+          select content from public.companion_v3_routine_run_entries
+          where org_id=${ids.org}::uuid and companion_id=${ids.companion}::uuid
+            and run_id=${turnId}::uuid and role='assistant'`;
+      expect(result).toEqual([{ content: `turn fallback ${lane}` }]);
+    },
+  );
+
+  it.each(["main", "background"] as const)(
+    "durably surfaces a cross-page terminal model error for the %s lane",
+    async (lane) => {
+      const invocationId = `invocation-terminal-model-error-${lane}`;
+      const messageId = randomUUID();
+      await seedPreparedV3(invocationId);
+      let turnId = "";
+      let correlatedTurnId: string | null = null;
+      if (lane === "main") {
+        await asApi(async (sql) => {
+          const rows = await sql<Array<{ turn: { id: string } }>>`
+            select turn from public.companion_v3_api_enqueue_warm_turn(
+              ${ids.org}::uuid,${ids.companion}::uuid,${messageId}::uuid,
+              'surface the terminal model error')`;
+          turnId = rows[0]!.turn.id;
+          const correlated = await sql<Array<{ turn: { id: string } }>>`
+            select turn from public.companion_v3_api_enqueue_warm_turn(
+              ${ids.org}::uuid,${ids.companion}::uuid,${randomUUID()}::uuid,
+              'correlated steer sees the same terminal model error')`;
+          correlatedTurnId = correlated[0]!.turn.id;
+        });
+      } else {
+        const eventId = `msg:${messageId}`;
+        await ownerSql`insert into public.companion_threads(org_id,companion_id)
+          values(${ids.org}::uuid,${ids.companion}::uuid) on conflict do nothing`;
+        await ownerSql`with advanced as (
+          update public.companion_threads set next_ordinal=next_ordinal+1,
+            projection_sequence=projection_sequence+1,updated_at=clock_timestamp()
+          where org_id=${ids.org}::uuid and companion_id=${ids.companion}::uuid
+          returning next_ordinal-1 as ordinal,projection_sequence
+        ) insert into public.companion_transcript_entries(
+          org_id,companion_id,event_id,ordinal,projection_sequence,role,content,author_id)
+        select ${ids.org}::uuid,${ids.companion}::uuid,${eventId},ordinal,projection_sequence,
+          'user','surface the routine terminal model error',${ids.owner} from advanced`;
+        const admitted = await ownerSql<Array<{ turnId: string }>>`
+          select turn_id as "turnId" from public.companion_v3_admit_turn(
+            ${ids.org}::uuid,${ids.companion}::uuid,${messageId}::uuid,${eventId},
+            ${ids.owner},'background')`;
+        turnId = admitted[0]!.turnId;
+        await seedBackgroundRun(turnId, "Terminal model error fixture");
+      }
+
+      const convergence = lane === "main"
+        ? createRuntimeV3PostgresWarmConvergence(runtimeSql, { enabledLanes: new Set(["main"]) })
+        : createRuntimeV3PostgresRoutineConvergence(runtimeSql);
+      const persistence = lane === "main"
+        ? createRuntimeV3PostgresWarmTurnPersistence(runtimeSql)
+        : createRuntimeV3PostgresRoutineTurnPersistence(runtimeSql);
+      const claim = await convergence.claimLane({
+        executorId: `runtime-terminal-model-error-${lane}`, lane,
+      });
+      const material = await persistence.authorize(claim!);
+      await persistence.beginAdmission(claim!, {
+        invocationId: material!.piInvocationId, cursor: 0n,
+      });
+      await persistence.recordAdmission(claim!, {
+        invocationId: material!.piInvocationId, responseTurnId: turnId, cursor: 0n,
+      });
+      if (correlatedTurnId) {
+        await ownerSql`update public.companion_v3_turns set
+          state='admitted',admission_state='accepted',admission_started_at=clock_timestamp(),
+          admitted_at=clock_timestamp(),admission_kind='steer',pi_invocation_id=${invocationId},
+          response_turn_id=${turnId}::uuid,admission_cursor=0,activity_cursor=0,
+          correlated_activity_cursor=0,last_activity_at=clock_timestamp(),
+          inactivity_deadline_at=clock_timestamp()+interval '10 minutes',
+          absolute_deadline_at=clock_timestamp()+interval '2 hours'
+          where org_id=${ids.org}::uuid and companion_id=${ids.companion}::uuid
+            and id=${correlatedTurnId}::uuid`;
+      }
+
+      await expect(persistence.project(claim!, {
+        throughCursor: 17n,
+        assistant: [],
+        assistantFallbacks: [],
+        terminalError: {
+          sequence: 17n,
+          code: "model_unavailable",
+          message: "The selected model is unavailable. Choose a different model and try again.",
+          action: "switch_model",
+        },
+        privateEntries: lane === "background" ? [] : undefined,
+        decisions: [],
+        routineReturns: [],
+        needsInput: false,
+        settled: false,
+        processExited: false,
+        activity: true,
+      })).resolves.toBe(true);
+      await convergence.completeProgression(claim!, { kind: "release" });
+
+      const takeover = await convergence.claimLane({
+        executorId: `runtime-terminal-model-error-takeover-${lane}`, lane,
+      });
+      await expect(persistence.project(takeover!, {
+        throughCursor: 18n,
+        assistant: [],
+        assistantFallbacks: [],
+        terminalError: null,
+        privateEntries: lane === "background" ? [] : undefined,
+        decisions: [],
+        routineReturns: [],
+        needsInput: false,
+        settled: true,
+        processExited: false,
+        activity: false,
+      })).resolves.toBe("failed");
+      await convergence.completeProgression(takeover!, { kind: "ack_completed" });
+
+      const outcome = await ownerSql<Array<{ id: string; code: string; message: string; action: string }>>`
+        select id,outcome_code as code,outcome_message as message,outcome_action::text as action
+        from public.companion_v3_turns where org_id=${ids.org}::uuid
+          and companion_id=${ids.companion}::uuid
+          and id=any(${correlatedTurnId ? [turnId, correlatedTurnId] : [turnId]}::uuid[])
+        order by queue_sequence`;
+      expect(outcome).toEqual((correlatedTurnId ? [turnId, correlatedTurnId] : [turnId]).map((id) => ({
+        id,
+        code: "model_unavailable",
+        message: "The selected model is unavailable. Choose a different model and try again.",
+        action: "switch_model",
+      })));
+      const visible = lane === "main"
+        ? await ownerSql<Array<{ role: string; content: string }>>`
+          select role::text,content from public.companion_transcript_entries
+          where org_id=${ids.org}::uuid and companion_id=${ids.companion}::uuid
+            and event_id=${`v3:${turnId}:error:17`}`
+        : await ownerSql<Array<{ role: string; content: string }>>`
+          select role::text,content from public.companion_v3_routine_run_entries
+          where org_id=${ids.org}::uuid and companion_id=${ids.companion}::uuid
+            and run_id=${turnId}::uuid and event_id='error:17'`;
+      expect(visible).toEqual([{
+        role: "system",
+        content: "The selected model is unavailable. Choose a different model and try again.",
+      }]);
+    },
+  );
+
+  it("never duplicates the primary message_end result with a terminal-envelope copy", async () => {
+    const invocationId = "invocation-primary-terminal-copy";
+    const messageId = randomUUID();
+    await seedPreparedV3(invocationId);
+    let turnId = "";
+    await asApi(async (sql) => {
+      const rows = await sql<Array<{ turn: { id: string } }>>`
+        select turn from public.companion_v3_api_enqueue_warm_turn(
+          ${ids.org}::uuid,${ids.companion}::uuid,${messageId}::uuid,'keep the primary answer')`;
+      turnId = rows[0]!.turn.id;
+    });
+    const convergence = createRuntimeV3PostgresWarmConvergence(runtimeSql, {
+      enabledLanes: new Set(["main"]),
+    });
+    const persistence = createRuntimeV3PostgresWarmTurnPersistence(runtimeSql);
+    const claim = await convergence.claimLane({ executorId: "runtime-primary-copy", lane: "main" });
+    const material = await persistence.authorize(claim!);
+    await persistence.beginAdmission(claim!, { invocationId: material!.piInvocationId, cursor: 0n });
+    await persistence.recordAdmission(claim!, {
+      invocationId: material!.piInvocationId, responseTurnId: turnId, cursor: 0n,
+    });
+
+    await expect(persistence.project(claim!, {
+      throughCursor: 3n,
+      assistant: [{ eventId: `v3:${turnId}:1`, content: "Primary answer" }],
+      assistantFallbacks: [
+        { sequence: 2n, source: "turn_end", content: "Copied answer" },
+      ],
+      decisions: [],
+      needsInput: false,
+      settled: true,
+      processExited: false,
+      activity: true,
+    })).resolves.toBe("succeeded");
+    await convergence.completeProgression(claim!, { kind: "ack_completed" });
+
+    const assistant = await ownerSql<Array<{ content: string }>>`
+      select content from public.companion_transcript_entries
+      where org_id=${ids.org}::uuid and companion_id=${ids.companion}::uuid
+        and role='assistant' and event_id like ${`v3:${turnId}:%`}`;
+    expect(assistant).toEqual([{ content: "Primary answer" }]);
+  });
+
   it("queues the shared Pi-only Restart while cold and joins the resulting Runtime v3 repair", async () => {
     await seedPreparedV3("invocation-manual-restart");
     // A staged, not-yet-prepared instance is cold. Advanced recovery must remain requestable and

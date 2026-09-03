@@ -153,8 +153,29 @@ export type RuntimePiProjection =
   | { sequence: bigint; type: "settled" }
   | { sequence: bigint; type: "process_exit"; code: number | null; signal: string | null };
 
+/**
+ * A documented terminal-envelope copy of the final assistant message. Runtime v3 checkpoints
+ * these candidates separately and promotes exactly one only when `agent_settled` proves the
+ * response is quiescent and no primary `message_end` result exists.
+ */
+export interface PiAssistantFallbackProjection {
+  sequence: bigint;
+  source: "turn_end" | "agent_end";
+  content: string;
+}
+
+/** Product-owned, expurgated outcome for a terminal model error that produced no assistant text. */
+export interface PiTerminalErrorProjection {
+  sequence: bigint;
+  code: "model_unavailable";
+  message: "The selected model is unavailable. Choose a different model and try again.";
+  action: "switch_model";
+}
+
 export interface ClassifiedPiJournalPage {
   projections: RuntimePiProjection[];
+  assistantFallbacks: PiAssistantFallbackProjection[];
+  terminalError: PiTerminalErrorProjection | null;
   throughCursor: bigint;
   unknownEvents: number;
   activity: boolean;
@@ -418,14 +439,13 @@ function contentBlocks(message: Record<string, unknown>): Record<string, unknown
     : [];
 }
 
-function assistantProjection(
+function assistantMessageProjection(
   sequence: bigint,
-  event: Record<string, unknown>,
+  messageValue: unknown,
   redact: RuntimeVisibleTextRedactor,
 ): Extract<RuntimePiProjection, { type: "assistant" }> | null {
-  if (event.type !== "message_end") return null;
-  if (!event.message || typeof event.message !== "object" || Array.isArray(event.message)) return null;
-  const message = event.message as Record<string, unknown>;
+  if (!messageValue || typeof messageValue !== "object" || Array.isArray(messageValue)) return null;
+  const message = messageValue as Record<string, unknown>;
   if (message.role !== "assistant") return null;
   const blocks = contentBlocks(message);
   // Pi emits one completed assistant message before executing each tool batch, then another model
@@ -456,6 +476,65 @@ function assistantProjection(
     entry_key: `assistant:${sequence}`,
     content: bounded(content, MAX_ASSISTANT),
     ...(text && redactedReasoning ? { reasoning: boundedReasoning(redactedReasoning) } : {}),
+  };
+}
+
+function assistantProjection(
+  sequence: bigint,
+  event: Record<string, unknown>,
+  redact: RuntimeVisibleTextRedactor,
+): Extract<RuntimePiProjection, { type: "assistant" }> | null {
+  return event.type === "message_end"
+    ? assistantMessageProjection(sequence, event.message, redact)
+    : null;
+}
+
+function assistantFallbackProjection(
+  sequence: bigint,
+  event: Record<string, unknown>,
+  redact: RuntimeVisibleTextRedactor,
+): PiAssistantFallbackProjection | null {
+  if (event.type === "turn_end") {
+    const assistant = assistantMessageProjection(sequence, event.message, redact);
+    return assistant
+      ? { sequence, source: "turn_end", content: assistant.content }
+      : null;
+  }
+  if (event.type !== "agent_end" || !Array.isArray(event.messages)) return null;
+  for (let index = event.messages.length - 1; index >= 0; index -= 1) {
+    const assistant = assistantMessageProjection(sequence, event.messages[index], redact);
+    if (assistant) return { sequence, source: "agent_end", content: assistant.content };
+  }
+  return null;
+}
+
+function terminalAssistantError(messageValue: unknown): boolean {
+  const message = dictionary(messageValue);
+  return message?.role === "assistant"
+    && message.stopReason === "error"
+    && typeof message.errorMessage === "string"
+    && message.errorMessage.trim().length > 0;
+}
+
+function terminalErrorProjection(
+  sequence: bigint,
+  event: Record<string, unknown>,
+): PiTerminalErrorProjection | null {
+  const failedAssistant = event.type === "message_end" || event.type === "turn_end"
+    ? terminalAssistantError(event.message)
+    : event.type === "agent_end" && Array.isArray(event.messages)
+      ? event.messages.some(terminalAssistantError)
+      : false;
+  const exhaustedRetry = event.type === "auto_retry_end"
+    && event.success === false
+    && typeof event.finalError === "string"
+    && event.finalError.trim().length > 0;
+  if (!failedAssistant && !exhaustedRetry) return null;
+  return {
+    sequence,
+    code: "model_unavailable",
+    message: "The selected model is unavailable. Choose a different model and try again.",
+    action: "switch_model",
   };
 }
 
@@ -1136,6 +1215,9 @@ export function classifyPiJournalPage(
   redact: RuntimeVisibleTextRedactor = genericRuntimeVisibleTextRedactor,
 ): ClassifiedPiJournalPage {
   const projections: RuntimePiProjection[] = [];
+  let turnEndFallback: PiAssistantFallbackProjection | null = null;
+  let agentEndFallback: PiAssistantFallbackProjection | null = null;
+  let terminalError: PiTerminalErrorProjection | null = null;
   let unknownEvents = 0;
   let activity = false;
   let needsInput = false;
@@ -1186,6 +1268,11 @@ export function classifyPiJournalPage(
     }
     const assistant = assistantProjection(record.sequence, record.event, redact);
     if (assistant) projections.push(assistant);
+    const assistantFallback = assistantFallbackProjection(record.sequence, record.event, redact);
+    if (assistantFallback?.source === "turn_end") turnEndFallback = assistantFallback;
+    if (assistantFallback?.source === "agent_end") agentEndFallback = assistantFallback;
+    const classifiedError = terminalErrorProjection(record.sequence, record.event);
+    if (classifiedError) terminalError = classifiedError;
     const tool = toolProjection(record.sequence, record.event, redact);
     if (tool) projections.push(tool);
     if (ACTIVITY_EVENT_TYPES.has(eventType)) {
@@ -1198,6 +1285,10 @@ export function classifyPiJournalPage(
 
   return {
     projections,
+    assistantFallbacks: [turnEndFallback, agentEndFallback]
+      .filter((item): item is PiAssistantFallbackProjection => item !== null)
+      .sort((left, right) => left.sequence < right.sequence ? -1 : 1),
+    terminalError,
     throughCursor: page.nextCursor,
     unknownEvents,
     activity,
