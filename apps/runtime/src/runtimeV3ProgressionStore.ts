@@ -2,6 +2,7 @@ import {
   decodeRuntimeV3PreparationSnapshot,
 } from "@companion/companion-runtime";
 import type {
+  RuntimeV3Claim,
   RuntimeV3ConvergencePersistence,
   RuntimeV3DecisionResponse,
   RuntimeV3DurableOutcome,
@@ -43,10 +44,12 @@ interface ClaimRow {
   admissionStartedAt: Date | null;
   inactivityDeadlineAt: Date | null;
   absoluteDeadlineAt: Date | null;
+  cleanupBoxId?: string | null;
+  cleanupInvocationId?: string | null;
 }
 
 interface TerminalCompletion {
-  outcome: "release" | "detached" | "ack_completed" | "retry_ack" | "succeeded" | "failed" | "interrupted" | "decision_ambiguous";
+  outcome: "release" | "detached" | "ack_completed" | "retry_ack" | "cleanup_completed" | "admission_rejected" | "succeeded" | "failed" | "interrupted" | "decision_ambiguous";
   code: string | null;
   message: string | null;
   action: string | null;
@@ -76,6 +79,7 @@ function terminalInput(outcome: RuntimeV3DurableOutcome): TerminalCompletion {
   if (
     outcome.kind === "failed"
     || outcome.kind === "interrupted"
+    || outcome.kind === "admission_rejected"
     || outcome.kind === "decision_ambiguous"
   ) {
     return {
@@ -104,13 +108,30 @@ export function createRuntimeV3PostgresWarmConvergence(
   return createPostgresConvergence(sql, true, options);
 }
 
+/** Strict background claim: routine projection must never consume a future trigger occurrence. */
+export function createRuntimeV3PostgresRoutineConvergence(
+  sql: Sql,
+): RuntimeV3ConvergencePersistence {
+  return createPostgresConvergence(sql, true, {
+    enabledLanes: new Set(["background"]),
+    routineOnly: true,
+  });
+}
+
 function createPostgresConvergence(
   sql: Sql,
   warmOnly: boolean,
-  options: { enabledLanes?: ReadonlySet<"main" | "background"> },
+  options: { enabledLanes?: ReadonlySet<"main" | "background">; routineOnly?: boolean },
 ): RuntimeV3ConvergencePersistence {
   return {
     async sweepLane({ lane, signal }) {
+      if (options.enabledLanes && !options.enabledLanes.has(lane)) return 0;
+      if (options.routineOnly) {
+        const routineRows = await abortable(sql<Array<{ swept: number }>>`
+          select public.companion_v3_runtime_sweep_routine_deadlines_v7(7) as swept
+        `, signal);
+        return routineRows[0]?.swept ?? 0;
+      }
       const decisionRows = await abortable(sql<Array<{ swept: number }>>`
         select public.companion_v3_runtime_sweep_decisions(${lane}, 6) as swept
       `, signal);
@@ -118,15 +139,25 @@ function createPostgresConvergence(
     },
     async claimLane({ executorId, lane, signal }) {
       if (options.enabledLanes && !options.enabledLanes.has(lane)) return null;
-      const rows = warmOnly
+      const rows = warmOnly && options.routineOnly
         ? await abortable(sql<ClaimRow[]>`
           select org_id as "orgId", companion_id as "companionId", turn_id as "turnId",
             command_id as "commandId", lane::text, state::text,
             claim_token as "claimToken", claim_epoch::text as "claimEpoch",
             gate_epoch::text as "gateEpoch", admission_started_at as "admissionStartedAt",
             inactivity_deadline_at as "inactivityDeadlineAt",
+            absolute_deadline_at as "absoluteDeadlineAt", cleanup_box_id as "cleanupBoxId",
+            cleanup_invocation_id as "cleanupInvocationId"
+          from public.companion_v3_runtime_claim_routine_v7(${executorId}, ${lane}, 30, 7)
+        `, signal)
+        : warmOnly ? await abortable(sql<ClaimRow[]>`
+          select org_id as "orgId", companion_id as "companionId", turn_id as "turnId",
+            command_id as "commandId", lane::text, state::text,
+            claim_token as "claimToken", claim_epoch::text as "claimEpoch",
+            gate_epoch::text as "gateEpoch", admission_started_at as "admissionStartedAt",
+            inactivity_deadline_at as "inactivityDeadlineAt",
             absolute_deadline_at as "absoluteDeadlineAt"
-          from public.companion_v3_runtime_claim_warm_v6(${executorId}, ${lane}, 30, 6)
+          from public.companion_v3_runtime_claim_warm_v7(${executorId}, ${lane}, 30, 7)
         `, signal)
         : await abortable(sql<ClaimRow[]>`
           select org_id as "orgId", companion_id as "companionId", turn_id as "turnId",
@@ -138,8 +169,8 @@ function createPostgresConvergence(
           from public.companion_v3_runtime_claim_v4(${executorId}, ${lane}, 30, 4)
         `, signal);
       const row = rows[0];
-      return row
-        ? {
+      if (!row) return null;
+      const claim: RuntimeV3Claim = {
           turn: turnFromRow(row),
           fence: {
             token: row.claimToken,
@@ -148,13 +179,19 @@ function createPostgresConvergence(
           },
           orgId: row.orgId,
           companionId: row.companionId,
-        }
-        : null;
+      };
+      if (row.cleanupBoxId && row.cleanupInvocationId) {
+        claim.cleanup = {
+          boxId: row.cleanupBoxId,
+          invocationId: row.cleanupInvocationId,
+        };
+      }
+      return claim;
     },
     async completeProgression(claim, outcome, signal) {
       const terminal = terminalInput(outcome);
       const rows = await abortable(sql<Array<{ completed: boolean }>>`
-        select public.companion_v3_runtime_complete_v6(
+        select public.companion_v3_runtime_complete_v7(
           ${claim.orgId}::uuid,
           ${claim.companionId}::uuid,
           ${claim.turn.lane},
@@ -166,7 +203,7 @@ function createPostgresConvergence(
           ${terminal.code},
           ${terminal.message},
           ${terminal.action}::public.companion_runtime_error_action,
-          6
+          7
         ) as completed
       `, signal);
       return rows[0]?.completed === true;
@@ -180,6 +217,10 @@ interface WarmMaterialRow {
   content: string;
   activityCursor: string;
   recoveryDeferred: boolean;
+}
+
+interface RoutineMaterialRow extends WarmMaterialRow {
+  persona: string | null;
 }
 
 interface DecisionActionRow {
@@ -468,7 +509,7 @@ export function createRuntimeV3PostgresWarmTurnPersistence(
         select box_id as "boxId", pi_invocation_id as "piInvocationId",
           content, activity_cursor::text as "activityCursor",
           recovery_deferred as "recoveryDeferred"
-        from public.companion_v3_runtime_authorize_warm_turn_v5(
+        from public.companion_v3_runtime_authorize_warm_turn_v7(
           ${claim.orgId}::uuid,
           ${claim.companionId}::uuid,
           ${claim.turn.lane},
@@ -476,7 +517,7 @@ export function createRuntimeV3PostgresWarmTurnPersistence(
           ${claim.fence.token}::uuid,
           ${claim.fence.epoch.toString()}::bigint,
           ${claim.fence.gateEpoch.toString()}::bigint,
-          5
+          7
         )
       `, signal);
       const row = rows[0];
@@ -588,6 +629,74 @@ export function createRuntimeV3PostgresWarmTurnPersistence(
         ) as finished
       `, signal);
       return rows[0]?.finished === true;
+    },
+  };
+}
+
+/** Background routine projection stays private while sharing the v3 lane/fence machinery. */
+export function createRuntimeV3PostgresRoutineTurnPersistence(
+  sql: Sql,
+): RuntimeV3WarmTurnPersistence {
+  const ordinary = createRuntimeV3PostgresWarmTurnPersistence(sql);
+  return {
+    ...ordinary,
+    async authorize(claim, signal) {
+      const rows = await abortable(sql<RoutineMaterialRow[]>`
+        select box_id as "boxId", pi_invocation_id as "piInvocationId", content,
+          activity_cursor::text as "activityCursor", false as "recoveryDeferred", persona
+        from public.companion_v3_runtime_authorize_routine(
+          ${claim.orgId}::uuid, ${claim.companionId}::uuid, ${claim.turn.id}::uuid,
+          ${claim.fence.token}::uuid, ${claim.fence.epoch.toString()}::bigint,
+          ${claim.fence.gateEpoch.toString()}::bigint, 7
+        )
+      `, signal);
+      const row = rows[0];
+      return row ? {
+        boxId: row.boxId,
+        piInvocationId: row.piInvocationId,
+        content: row.content,
+        cursor: BigInt(row.activityCursor),
+        recoveryDeferred: false,
+        backgroundRoutine: true,
+        persona: row.persona,
+      } : null;
+    },
+    async beginAdmission(claim, input, signal) {
+      const rows = await abortable(sql<Array<{ begun: boolean }>>`
+        select public.companion_v3_runtime_begin_routine_admission(
+          ${claim.orgId}::uuid, ${claim.companionId}::uuid, ${claim.turn.id}::uuid,
+          ${claim.fence.token}::uuid, ${claim.fence.epoch.toString()}::bigint,
+          ${claim.fence.gateEpoch.toString()}::bigint, ${input.invocationId},
+          ${input.cursor.toString()}::bigint, 7
+        ) as begun
+      `, signal);
+      return rows[0]?.begun === true;
+    },
+    async project(claim, projection, signal) {
+      const rows = await abortable(sql<Array<{ projected: string | null }>>`
+        select public.companion_v3_runtime_project_routine_page(
+          ${claim.orgId}::uuid, ${claim.companionId}::uuid, ${claim.turn.id}::uuid,
+          ${claim.fence.token}::uuid, ${claim.fence.epoch.toString()}::bigint,
+          ${claim.fence.gateEpoch.toString()}::bigint,
+          ${projection.throughCursor.toString()}::bigint,
+          ${sql.json((projection.privateEntries ?? []).map((item) => ({
+            ...item, sequence: item.sequence.toString(),
+          })))}::jsonb,
+          ${sql.json((projection.decisions ?? []).map((item) => ({
+            ...item, sequence: item.sequence.toString(),
+          })))}::jsonb,
+          ${sql.json((projection.routineReturns ?? []).map((item) => ({
+            ...item, sequence: item.sequence.toString(),
+          })))}::jsonb,
+          ${projection.needsInput}, ${projection.activity},
+          ${projection.processExited ? "process_exit" : projection.settled ? "settled" : null},
+          7
+        ) as projected
+      `, signal);
+      const projected = rows[0]?.projected;
+      return projected === "succeeded" || projected === "failed" || projected === "detached"
+        ? projected
+        : projected === "projected";
     },
   };
 }

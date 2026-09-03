@@ -93,6 +93,7 @@ export interface RuntimeV3Claim {
   companionId: string;
   turn: RuntimeV3Turn;
   fence: RuntimeV3Fence;
+  cleanup?: { boxId: string; invocationId: string };
 }
 
 export type RuntimeV3ProgressionOutcome =
@@ -100,6 +101,8 @@ export type RuntimeV3ProgressionOutcome =
   | { kind: "detached" }
   | { kind: "ack_completed" }
   | { kind: "retry_ack" }
+  | { kind: "cleanup_completed" }
+  | { kind: "admission_rejected"; code: string; message: unknown; action: RuntimeV3ErrorAction }
   | { kind: "succeeded" }
   | { kind: "failed"; code: string; message: unknown; action: RuntimeV3ErrorAction }
   | { kind: "interrupted"; code: string; message: unknown; action: RuntimeV3ErrorAction }
@@ -112,6 +115,8 @@ export type RuntimeV3DurableOutcome =
   | { kind: "detached" }
   | { kind: "ack_completed" }
   | { kind: "retry_ack" }
+  | { kind: "cleanup_completed" }
+  | { kind: "admission_rejected"; error: SafeRuntimeError }
   | { kind: "succeeded" }
   | { kind: "failed"; error: SafeRuntimeError }
   | { kind: "interrupted"; error: SafeRuntimeError }
@@ -362,6 +367,9 @@ export interface RuntimeV3WarmTurnMaterial {
   content: string;
   cursor: bigint;
   recoveryDeferred?: boolean;
+  /** Routine work runs in its own Pi session while sharing the durable Box workspace. */
+  backgroundRoutine?: boolean;
+  persona?: string | null;
 }
 
 export interface RuntimeV3WarmTurnProjection {
@@ -377,6 +385,8 @@ export interface RuntimeV3WarmTurnProjection {
     cacheWrite: number | null;
   }>;
   decisions?: Array<Extract<RuntimePiProjection, { type: "decision" }> & { eventId: string }>;
+  privateEntries?: RuntimePiProjection[];
+  routineReturns?: Array<Extract<RuntimePiProjection, { type: "routine_return" }>>;
   needsInput: boolean;
   settled: boolean;
   processExited: boolean;
@@ -426,6 +436,7 @@ export interface RuntimeV3WarmPi {
     turnId: string;
     expectedInvocationId: string;
     message: string;
+    persona?: string | null;
     signal?: AbortSignal;
   }): Promise<
     | {
@@ -447,8 +458,16 @@ export interface RuntimeV3WarmPi {
   acknowledge(input: {
     boxId: string;
     through: bigint;
+    turnId?: string;
+    invocationId?: string;
     signal?: AbortSignal;
   }): Promise<bigint>;
+  terminate?(input: {
+    boxId: string;
+    turnId: string;
+    invocationId: string;
+    signal?: AbortSignal;
+  }): Promise<void>;
   abort?(input: {
     boxId: string;
     commandId: string;
@@ -505,6 +524,7 @@ function durableOutcome(outcome: RuntimeV3ProgressionOutcome): RuntimeV3DurableO
   if (
     outcome.kind !== "failed"
     && outcome.kind !== "interrupted"
+    && outcome.kind !== "admission_rejected"
     && outcome.kind !== "decision_ambiguous"
   ) return outcome;
   return {
@@ -526,6 +546,20 @@ export function createRuntimeV3WarmTurnAdvance(
   options: RuntimeV3WarmTurnAdvanceOptions,
 ): RuntimeV3ConvergenceOptions["advance"] {
   return async (claim, signal) => {
+    if (claim.cleanup) {
+      if (!options.pi.terminate) return { kind: "release" };
+      try {
+        await options.pi.terminate({
+          boxId: claim.cleanup.boxId,
+          turnId: claim.turn.id,
+          invocationId: claim.cleanup.invocationId,
+          signal: boundedSignal(signal, COMPANION_RUNTIME_V3_BUDGETS.heartbeatCommandMs),
+        });
+        return { kind: "cleanup_completed" };
+      } catch {
+        return { kind: "release" };
+      }
+    }
     let projectionPendingAck: "none" | "nonterminal" | "terminal" = "none";
     let projectionWriteIntent = false;
     let prePiHandoff = false;
@@ -569,6 +603,8 @@ export function createRuntimeV3WarmTurnAdvance(
         await options.pi.acknowledge({
           boxId: material.boxId,
           through: cursor,
+          turnId: claim.turn.id,
+          invocationId,
           signal: boundedSignal(signal, COMPANION_RUNTIME_V3_BUDGETS.heartbeatSettlementMs),
         });
         projectionPendingAck = "none";
@@ -597,11 +633,19 @@ export function createRuntimeV3WarmTurnAdvance(
           turnId: claim.turn.id,
           expectedInvocationId: material.piInvocationId,
           message: material.content,
+          persona: material.persona,
           signal: admissionSignal,
         });
         if (admission.outcome === "rejected") {
           admissionWriteIntent = false;
-          return { kind: "release" };
+          return claim.turn.lane === "background"
+            ? {
+              kind: "admission_rejected",
+              code: admission.code,
+              message: "Pi rejected the routine before accepting its prompt.",
+              action: "none",
+            }
+            : { kind: "release" };
         }
         if (admission.outcome === "ambiguous") {
           return {
@@ -794,7 +838,7 @@ export function createRuntimeV3WarmTurnAdvance(
             }]
             : []);
         assistantResults += assistant.length;
-        if (assistantResults > 1) {
+        if (!material.backgroundRoutine && assistantResults > 1) {
           return {
             kind: "failed",
             code: "pi_result_count_invalid",
@@ -820,6 +864,10 @@ export function createRuntimeV3WarmTurnAdvance(
             && item.request_kind === "question"
             ? [{ ...item, eventId: `v3:${claim.turn.id}:decision:${item.sequence.toString()}` }]
             : []),
+          privateEntries: material.backgroundRoutine ? classified.projections : undefined,
+          routineReturns: material.backgroundRoutine
+            ? classified.projections.filter((item) => item.type === "routine_return")
+            : undefined,
           needsInput: projectedNeedsInput,
           settled: classified.settled,
           processExited: classified.processExit !== null,
@@ -845,6 +893,8 @@ export function createRuntimeV3WarmTurnAdvance(
         await options.pi.acknowledge({
           boxId: material.boxId,
           through: classified.throughCursor,
+          turnId: claim.turn.id,
+          invocationId,
           signal: boundedSignal(signal, commandWindow.settlementMs),
         });
         projectionPendingAck = "none";
@@ -881,7 +931,7 @@ export function createRuntimeV3WarmTurnAdvance(
         }
         if (projectedNeedsInput) return { kind: "release" };
         if (classified.settled) {
-          return assistantResults === 1
+          return material.backgroundRoutine || assistantResults === 1
             ? { kind: "succeeded" }
             : {
               kind: "failed",

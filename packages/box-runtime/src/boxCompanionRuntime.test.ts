@@ -2085,6 +2085,71 @@ describe("isolated routine Pi sessions", () => {
     }
   });
 
+  it("stages live memory and current capabilities for direct workspace routine runs", async () => {
+    const commands: string[] = [];
+    const files: Array<{ path: string; content: string }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (rawUrl: string | URL | Request, init?: RequestInit) => {
+      const url = String(rawUrl);
+      const body = parseBoxTestBody(init?.body);
+      if (url.endsWith("/files") && init?.method === "PUT") {
+        files.push({ path: requiredText(body, "path"), content: requiredText(body, "content") });
+        return response({ ok: true });
+      }
+      if (url.endsWith("/commands") && init?.method === "POST") {
+        const command = requiredText(body, "command");
+        commands.push(command);
+        if (command.includes("routine-pi-session-prepared")) {
+          return response(commandResult("routine-pi-session-prepared\n"));
+        }
+        if (command.includes("routine-pi-session-ready")) {
+          return response(commandResult(`routine-pi-session-ready ${invocationId}\n`));
+        }
+        return response(commandResult());
+      }
+      throw new Error(`unexpected Box request: ${init?.method ?? "GET"} ${url}`);
+    }));
+    const runtime = new AsciiBoxCompanionRuntime({ COMPANION_BOX_API_KEY: "box_test" });
+
+    await expect(runtime.startRoutineSession({
+      boxId: "bx_23456789",
+      runId,
+      persona: "Routine persona.",
+      validationOnly: false,
+      directWorkspace: true,
+      expectedInvocationId: invocationId,
+    })).resolves.toMatchObject({ state: "idle", invocationId });
+
+    expect(files[0]).toEqual(expect.objectContaining({
+      content: composedRoutineInstructions("Routine persona."),
+    }));
+    const preparation = commands[0]!;
+    expect(preparation).toContain('cp -a "$HOME/.companion/pi/." "$routine_root/pi/"');
+    expect(preparation).toContain('cp -a "$HOME/.companion/runtime/skills" "$routine_root/skills"');
+    expect(preparation).toContain('cp -a "$HOME/.companion/tools/." "$routine_root/tools/"');
+    expect(preparation).toContain("mcp-accounts.json");
+    expect(preparation).not.toContain("parent_memory=");
+    expect(preparation).not.toContain("routine_memory=");
+    expect(preparation).not.toContain("COMPANION_ROUTINE_MCP=");
+    expect(preparation).not.toContain("companion-routine \"$@\"");
+    const launch = commands.at(-1)!;
+    expect(launch).toContain('provider_env="/run/user/$(id -u)/companion/providers.env"');
+    expect(launch).toContain('export PI_MEMORY_DIR="$HOME/.companion/runtime/memory"');
+    expect(launch).toContain('export QMD_CONFIG_DIR="$HOME/.companion/runtime/qmd/config"');
+    expect(launch).toContain('export INDEX_PATH="$HOME/.companion/runtime/qmd/index.sqlite"');
+    expect(launch).not.toContain('export PI_MEMORY_DIR="$routine_root/memory"');
+    expect(launch).not.toContain("unset COMPANION_CONTROL_TOKEN");
+    expect(launch).not.toContain("COMPANION_PI_VALIDATION_ONLY=1");
+    const instructions = files[0]?.content ?? "";
+    expect(instructions).toContain("same live durable paths as");
+    expect(instructions).toContain("durable memory changes you make remain visible");
+    expect(instructions).toContain("always-available `companion-control` MCP");
+    expect(instructions).toContain("Peer messages require a directed grant");
+    expect(instructions).toContain("- Skills:");
+    expect(instructions).toContain("- Plugins:");
+    expect(instructions).not.toContain("private snapshot");
+    expect(instructions).not.toContain("cannot use companion-control");
+  });
+
   it("pins the main Companion memory into the disposable routine root", async () => {
     const boxHome = mkdtempSync(join(tmpdir(), "companion-routine-memory-"));
     const parentMemory = join(boxHome, ".companion", "runtime", "memory");
