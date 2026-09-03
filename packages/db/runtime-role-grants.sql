@@ -934,6 +934,13 @@ BEGIN
         'public.companion_api_get_delegation(uuid,uuid,uuid)'::regprocedure,
         'public.companion_api_schedule_pi_restart(uuid,uuid,uuid,uuid,uuid)'::regprocedure
       ];
+      IF pg_catalog.to_regprocedure(
+        'public.companion_v3_api_cancel_delegation_turn(uuid,uuid,uuid)'
+      ) IS NOT NULL THEN
+        companion_api_functions := companion_api_functions || ARRAY[
+          'public.companion_v3_api_cancel_delegation_turn(uuid,uuid,uuid)'::regprocedure
+        ];
+      END IF;
       internal_runtime_functions := internal_runtime_functions || ARRAY[
         'public.companion_revoke_inactive_control_token()'::regprocedure,
         'public.companion_enqueue_deferred_pi_restart()'::regprocedure,
@@ -1113,6 +1120,16 @@ BEGIN
         'public.companion_v3_runtime_project_background_page_v8(uuid,uuid,uuid,uuid,bigint,bigint,bigint,jsonb,jsonb,jsonb,boolean,boolean,text,integer)'::regprocedure,
         'public.companion_v3_runtime_sweep_background_deadlines_v8(integer)'::regprocedure,
         'public.companion_v3_runtime_complete_v8(uuid,uuid,public.companion_v3_lane,uuid,uuid,bigint,bigint,text,text,text,public.companion_runtime_error_action,integer)'::regprocedure
+      ];
+    END IF;
+
+    IF pg_catalog.to_regprocedure(
+      'public.companion_v3_runtime_pending_delegation_cancel(uuid,uuid,uuid,uuid,bigint,bigint,integer)'
+    ) IS NOT NULL THEN
+      companion_runtime_functions := companion_runtime_functions || ARRAY[
+        'public.companion_v3_runtime_project_native_page_v7(uuid,uuid,public.companion_v3_lane,uuid,uuid,bigint,bigint,bigint,jsonb,jsonb,jsonb,boolean,boolean,text,integer)'::regprocedure,
+        'public.companion_v3_runtime_pending_delegation_cancel(uuid,uuid,uuid,uuid,bigint,bigint,integer)'::regprocedure,
+        'public.companion_v3_runtime_finish_delegation_cancel(uuid,uuid,uuid,uuid,uuid,bigint,bigint,integer)'::regprocedure
       ];
     END IF;
 
