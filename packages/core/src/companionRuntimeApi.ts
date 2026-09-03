@@ -574,6 +574,67 @@ type ThreadReadRow = {
   routine_notify_returns: unknown;
 };
 
+type RuntimeV3ThreadProjectionRow = {
+  active_turn: unknown;
+  queued_count: number | string;
+  is_replying: boolean;
+  message_turns: unknown;
+};
+
+const runtimeV3MessageTurnsSchema = z.array(z.object({
+  event_id: z.string().min(1).max(200),
+  turn: companionTurnSchema,
+}).strict());
+
+async function runtimeV3ThreadProjection(input: {
+  orgId: string;
+  companionId: string;
+  eventIds: string[];
+  database: Db;
+}): Promise<RuntimeV3ThreadProjectionRow | null> {
+  const result = await input.database.execute(sql`
+    select * from public.companion_v3_api_read_projection(
+      ${input.orgId}::uuid,
+      ${input.companionId}::uuid,
+      ${JSON.stringify(input.eventIds)}::jsonb
+    )
+  `);
+  return rows<RuntimeV3ThreadProjectionRow>(result)[0] ?? null;
+}
+
+function projectRuntimeV3MessageTurns(
+  entries: readonly CompanionTranscriptEntry[],
+  projection: RuntimeV3ThreadProjectionRow | null,
+): CompanionTranscriptEntry[] {
+  if (!projection) return [...entries];
+  const turns = new Map(runtimeV3MessageTurnsSchema.parse(projection.message_turns)
+    .map((item) => [item.event_id, item.turn]));
+  return entries.map((entry) => {
+    const turn = turns.get(entry.event_id);
+    return turn && entry.role === "user"
+      ? { ...entry, turn_id: turn.id, queued: turn.status === "queued" }
+      : entry;
+  });
+}
+
+function mergedRuntimeActiveTurn(
+  v2: unknown,
+  v2Recovery: unknown,
+  v3: RuntimeV3ThreadProjectionRow | null,
+): CompanionTurn | null {
+  const v3Active = v3?.active_turn === null || v3?.active_turn === undefined
+    ? null
+    : companionTurnSchema.parse(v3.active_turn);
+  return v3Active ?? parseTurn(v2, v2Recovery);
+}
+
+function mergedRuntimeQueuedCount(
+  v2: number | string,
+  v3: RuntimeV3ThreadProjectionRow | null,
+): number {
+  return integer(v2) + (v3 ? integer(v3.queued_count) : 0);
+}
+
 export type RoutineNotifyReturn = CompanionRoutineNotifyReturn;
 
 type RoutineNotifyUnit = {
@@ -725,10 +786,17 @@ async function readCompanionThreadProjection(input: {
   const notifyReturns = z.array(companionRoutineNotifyReturnSchema).parse(
     row.routine_notify_returns,
   );
-  const entries = collapseRoutineNotifyEntries(visibleEntries, notifyReturns);
-  const activeTurn = parseTurn(row.active_turn, row.active_recovery_status);
+  let entries = collapseRoutineNotifyEntries(visibleEntries, notifyReturns);
+  const v3 = await runtimeV3ThreadProjection({
+    orgId: input.orgId,
+    companionId: input.companionId,
+    eventIds: entries.map((entry) => entry.event_id),
+    database: input.database,
+  });
+  entries = projectRuntimeV3MessageTurns(entries, v3);
+  const activeTurn = mergedRuntimeActiveTurn(row.active_turn, row.active_recovery_status, v3);
   const interruptedTurn = parseTurn(row.interrupted_turn, row.interrupted_recovery_status);
-  const queuedCount = integer(row.queued_count);
+  const queuedCount = mergedRuntimeQueuedCount(row.queued_count, v3);
   return {
     companion_id: input.companionId,
     viewer_id: input.actor.id,
@@ -821,10 +889,15 @@ function companionThreadMetadata(input: {
     | "interrupted_turn"
     | "active_recovery_status"
     | "interrupted_recovery_status"
-    | "last_message_at"
-    | "previous_last_read_ordinal">;
+      | "last_message_at"
+      | "previous_last_read_ordinal">;
+  runtimeV3?: RuntimeV3ThreadProjectionRow | null;
 }): CompanionThreadMetadata {
-  const activeTurn = parseTurn(input.row.active_turn, input.row.active_recovery_status);
+  const activeTurn = mergedRuntimeActiveTurn(
+    input.row.active_turn,
+    input.row.active_recovery_status,
+    input.runtimeV3 ?? null,
+  );
   const interruptedTurn = parseTurn(
     input.row.interrupted_turn,
     input.row.interrupted_recovery_status,
@@ -836,7 +909,7 @@ function companionThreadMetadata(input: {
     read_only: input.row.access_role === "viewer",
     can_send: input.row.access_role !== "viewer",
     active_turn: activeTurn?.status === "interrupted" ? null : activeTurn,
-    queued_count: integer(input.row.queued_count),
+    queued_count: mergedRuntimeQueuedCount(input.row.queued_count, input.runtimeV3 ?? null),
     interrupted_turn:
       interruptedTurn?.status === "interrupted" && interruptedTurn.resolution === null
         ? interruptedTurn
@@ -879,10 +952,22 @@ export async function readCompanionThreadWindowV2(input: {
   `);
   const [row] = rows<ThreadWindowReadRow>(result);
   if (!row) throw new Error("Companion thread window projection is unavailable");
-  const entries = z.array(companionTranscriptEntrySchema).parse(row.entries);
+  const storedEntries = z.array(companionTranscriptEntrySchema).parse(row.entries);
+  const runtimeV3 = await runtimeV3ThreadProjection({
+    orgId: input.orgId,
+    companionId: input.companionId,
+    eventIds: storedEntries.map((entry) => entry.event_id),
+    database: input.database,
+  });
+  const entries = projectRuntimeV3MessageTurns(storedEntries, runtimeV3);
   const sequence = bigintValue(row.sync_sequence);
   return companionThreadWindowSchema.parse({
-    thread: companionThreadMetadata({ actor: input.actor, companionId: input.companionId, row }),
+    thread: companionThreadMetadata({
+      actor: input.actor,
+      companionId: input.companionId,
+      row,
+      runtimeV3,
+    }),
     entries,
     older_cursor: row.older_before_ordinal === null
       ? null
@@ -933,6 +1018,13 @@ export async function readCompanionThreadChangesV2(input: {
   `);
   const [row] = rows<ThreadChangesReadRow>(result);
   if (!row) throw new Error("Companion thread changes projection is unavailable");
+  const storedEntries = z.array(companionTranscriptEntrySchema).parse(row.changed_entries);
+  const runtimeV3 = await runtimeV3ThreadProjection({
+    orgId: input.orgId,
+    companionId: input.companionId,
+    eventIds: storedEntries.map((entry) => entry.event_id),
+    database: input.database,
+  });
   const sequence = bigintValue(row.next_sequence);
   return companionThreadDeltaResponseSchema.parse({
     cursor: buildCompanionThreadSequenceCursor({
@@ -942,7 +1034,7 @@ export async function readCompanionThreadChangesV2(input: {
       sequence,
     }),
     reset_entries: false,
-    changed_entries: z.array(companionTranscriptEntrySchema).parse(row.changed_entries),
+    changed_entries: projectRuntimeV3MessageTurns(storedEntries, runtimeV3),
     deleted_event_ids: z.array(z.string().min(1).max(200)).parse(row.deleted_event_ids),
     thread: companionThreadMetadata({
       actor: input.actor,
@@ -951,6 +1043,7 @@ export async function readCompanionThreadChangesV2(input: {
         ...row,
         previous_last_read_ordinal: row.last_read_ordinal,
       },
+      runtimeV3,
     }),
     has_more: row.has_more,
     notify_returns: z.array(companionRoutineNotifyReturnSchema).parse(
@@ -977,7 +1070,7 @@ export async function readCompanionThreadProjectionSequenceV2(input: {
   return bigintValue(row.projection_sequence);
 }
 
-export async function enqueueCompanionTurnV2(input: {
+export async function enqueueCompanionTurn(input: {
   actor: ActorContext;
   orgId: string;
   companionId: string;
@@ -995,6 +1088,24 @@ export async function enqueueCompanionTurnV2(input: {
 }): Promise<{ turn: CompanionTurn; operation: CompanionOperation | null; replayed: boolean }> {
   const attachments = (input.attachments ?? []).map((attachment) =>
     companionAttachmentUploadSchema.parse(attachment));
+  if (attachments.length === 0) {
+    const v3Result = await input.database.execute(sql`
+      select * from public.companion_v3_api_enqueue_warm_turn(
+        ${input.orgId}::uuid,
+        ${input.companionId}::uuid,
+        ${input.clientMessageId}::uuid,
+        ${input.content}
+      )
+    `);
+    const [v3Row] = rows<{ turn: unknown; replayed: boolean }>(v3Result);
+    if (v3Row) {
+      return {
+        turn: companionTurnSchema.parse(v3Row.turn),
+        operation: null,
+        replayed: v3Row.replayed,
+      };
+    }
+  }
   const result = await input.database.execute(sql`
     select * from public.companion_api_enqueue_turn(
       ${input.orgId}::uuid,
@@ -1013,6 +1124,9 @@ export async function enqueueCompanionTurnV2(input: {
     replayed: row.replayed,
   };
 }
+
+/** Compatibility export for callers not yet renamed; behavior routes prepared warm text to v3. */
+export const enqueueCompanionTurnV2 = enqueueCompanionTurn;
 
 export interface CompanionAttachmentAsset {
   storageKey: string;

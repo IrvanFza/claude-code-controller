@@ -1,4 +1,5 @@
 import { safeRuntimeError } from "../errors";
+import { classifyPiJournalPage, type ValidatedPiJournalRead } from "../piEvents";
 import type { ErrorAction, SafeRuntimeError } from "../types";
 
 export const RUNTIME_V3_LANES = ["main", "background"] as const;
@@ -88,10 +89,15 @@ export interface RuntimeV3LifecyclePersistence {
 }
 
 export interface RuntimeV3ConvergencePersistence {
-  claimLane(input: { executorId: string; lane: RuntimeV3Lane }): Promise<RuntimeV3Claim | null>;
+  claimLane(input: {
+    executorId: string;
+    lane: RuntimeV3Lane;
+    signal?: AbortSignal;
+  }): Promise<RuntimeV3Claim | null>;
   completeProgression(
     claim: RuntimeV3Claim,
     outcome: RuntimeV3DurableOutcome,
+    signal?: AbortSignal,
   ): Promise<boolean>;
 }
 
@@ -108,7 +114,7 @@ export interface RuntimeV3ProgressionPersistence {
 export interface RuntimeV3Progression {
   admit(input: RuntimeV3Admission): Promise<RuntimeV3Turn>;
   desire(input: RuntimeV3DesiredLifecycleChange): Promise<RuntimeV3LifecycleRevision>;
-  converge(input: { executorId: string }): Promise<{
+  converge(input: { executorId: string; signal?: AbortSignal }): Promise<{
     progressed: number;
     exhausted: boolean;
   }>;
@@ -118,12 +124,82 @@ export type RuntimeV3Convergence = Pick<RuntimeV3Progression, "converge">;
 
 export interface RuntimeV3ProgressionOptions {
   persistence: RuntimeV3ProgressionPersistence;
-  advance: (claim: RuntimeV3Claim) => Promise<RuntimeV3ProgressionOutcome>;
+  advance: (
+    claim: RuntimeV3Claim,
+    signal?: AbortSignal,
+  ) => Promise<RuntimeV3ProgressionOutcome>;
 }
 
 export interface RuntimeV3ConvergenceOptions {
   persistence: RuntimeV3ConvergencePersistence;
-  advance: (claim: RuntimeV3Claim) => Promise<RuntimeV3ProgressionOutcome>;
+  advance: (
+    claim: RuntimeV3Claim,
+    signal?: AbortSignal,
+  ) => Promise<RuntimeV3ProgressionOutcome>;
+}
+
+export interface RuntimeV3WarmTurnMaterial {
+  boxId: string;
+  piInvocationId: string;
+  content: string;
+  cursor: bigint;
+}
+
+export interface RuntimeV3WarmTurnProjection {
+  throughCursor: bigint;
+  assistant: Array<{ eventId: string; content: string }>;
+  needsInput: boolean;
+  settled: boolean;
+}
+
+export interface RuntimeV3WarmTurnPersistence {
+  authorize(
+    claim: RuntimeV3Claim,
+    signal?: AbortSignal,
+  ): Promise<RuntimeV3WarmTurnMaterial | null>;
+  recordAdmission(
+    claim: RuntimeV3Claim,
+    input: { invocationId: string; cursor: bigint },
+    signal?: AbortSignal,
+  ): Promise<boolean>;
+  project(
+    claim: RuntimeV3Claim,
+    projection: RuntimeV3WarmTurnProjection,
+    signal?: AbortSignal,
+  ): Promise<boolean>;
+}
+
+export interface RuntimeV3WarmPi {
+  prompt(input: {
+    boxId: string;
+    commandId: string;
+    turnId: string;
+    expectedInvocationId: string;
+    message: string;
+    signal?: AbortSignal;
+  }): Promise<
+    | { outcome: "accepted"; invocationId: string; initialCursor: bigint }
+    | { outcome: "rejected"; code: string }
+    | { outcome: "ambiguous"; code: string }
+  >;
+  read(input: {
+    boxId: string;
+    after: bigint;
+    turnId: string;
+    invocationId: string;
+    signal?: AbortSignal;
+  }): Promise<ValidatedPiJournalRead>;
+  acknowledge(input: {
+    boxId: string;
+    through: bigint;
+    signal?: AbortSignal;
+  }): Promise<bigint>;
+}
+
+export interface RuntimeV3WarmTurnAdvanceOptions {
+  persistence: RuntimeV3WarmTurnPersistence;
+  pi: RuntimeV3WarmPi;
+  wait?: () => Promise<void>;
 }
 
 const LANE_CONVERGENCE_LIMIT = 16;
@@ -141,10 +217,186 @@ function durableOutcome(outcome: RuntimeV3ProgressionOutcome): RuntimeV3DurableO
 }
 
 /**
- * The dormant v3 deep module. It is intentionally absent from every production composition root;
- * later tracer bullets can move behavior behind this interface without teaching callers lease
- * choreography. Its internal composition requires an explicit advance adapter so claimed work
- * can never be silently released by a partial composition.
+ * Warm text tracer bullet kept behind the progression seam. The runtime composition supplies only
+ * a PostgreSQL adapter and the Pi boundary; callers never coordinate admission, projection, ACK,
+ * or lane release themselves.
+ */
+export function createRuntimeV3WarmTurnAdvance(
+  options: RuntimeV3WarmTurnAdvanceOptions,
+): RuntimeV3ConvergenceOptions["advance"] {
+  return async (claim, signal) => {
+    try {
+      signal?.throwIfAborted();
+      const material = signal
+        ? await options.persistence.authorize(claim, signal)
+        : await options.persistence.authorize(claim);
+      signal?.throwIfAborted();
+      if (!material) {
+        return {
+          kind: "failed",
+          code: "warm_turn_unauthorized",
+          message: "The warm Turn is no longer authorized to run.",
+          action: "none",
+        };
+      }
+      let invocationId = material.piInvocationId;
+      let cursor = material.cursor;
+      if (claim.turn.state === "queued") {
+        const admission = await options.pi.prompt({
+          boxId: material.boxId,
+          commandId: claim.turn.commandId,
+          turnId: claim.turn.id,
+          expectedInvocationId: material.piInvocationId,
+          message: material.content,
+          signal,
+        });
+        signal?.throwIfAborted();
+        if (admission.outcome === "rejected") {
+          return {
+            kind: "failed",
+            code: "pi_admission_rejected",
+            message: "Pi rejected the warm Turn.",
+            action: "none",
+          };
+        }
+        if (admission.outcome === "ambiguous") {
+          return {
+            kind: "interrupted",
+            code: "pi_admission_ambiguous",
+            message: "Pi admission could not be confirmed.",
+            action: "none",
+          };
+        }
+        const admissionRecord = {
+          invocationId: admission.invocationId,
+          cursor: admission.initialCursor,
+        };
+        const admitted = signal
+          ? await options.persistence.recordAdmission(claim, admissionRecord, signal)
+          : await options.persistence.recordAdmission(claim, admissionRecord);
+        signal?.throwIfAborted();
+        if (!admitted) {
+          return {
+            kind: "interrupted",
+            code: "pi_admission_fence_lost",
+            message: "Pi admission could not be recorded safely.",
+            action: "none",
+          };
+        }
+        invocationId = admission.invocationId;
+        cursor = admission.initialCursor;
+      } else if (claim.turn.state !== "needs_input") {
+        return {
+          kind: "interrupted",
+          code: "warm_turn_state_invalid",
+          message: "The warm Turn cannot resume from its durable state.",
+          action: "none",
+        };
+      }
+
+      let assistantResults = 0;
+      for (let pageNumber = 0; pageNumber < 32; pageNumber += 1) {
+        const page = await options.pi.read({
+          boxId: material.boxId,
+          after: cursor,
+          turnId: claim.turn.id,
+          invocationId,
+          signal,
+        });
+        signal?.throwIfAborted();
+        if (claim.turn.state === "needs_input" && page.events.length === 0 && !page.hasMore) {
+          return { kind: "release" };
+        }
+        const classified = classifyPiJournalPage(page);
+        const assistant = classified.projections.flatMap((projection) =>
+          projection.type === "assistant"
+            ? [{
+              eventId: `v3:${claim.turn.id}:${projection.sequence.toString()}`,
+              content: projection.content,
+            }]
+            : []);
+        assistantResults += assistant.length;
+        if (assistantResults > 1) {
+          return {
+            kind: "failed",
+            code: "pi_result_count_invalid",
+            message: "Pi produced more than one assistant result for the Turn.",
+            action: "none",
+          };
+        }
+        const projection = {
+          throughCursor: classified.throughCursor,
+          assistant,
+          needsInput: classified.needsInput,
+          settled: classified.settled,
+        };
+        const projected = signal
+          ? await options.persistence.project(claim, projection, signal)
+          : await options.persistence.project(claim, projection);
+        signal?.throwIfAborted();
+        if (!projected) {
+          return {
+            kind: "interrupted",
+            code: "pi_projection_fence_lost",
+            message: "Pi output could not be projected safely.",
+            action: "none",
+          };
+        }
+        await options.pi.acknowledge({
+          boxId: material.boxId,
+          through: classified.throughCursor,
+          signal,
+        });
+        signal?.throwIfAborted();
+        cursor = classified.throughCursor;
+        if (classified.processExit) {
+          return {
+            kind: "failed",
+            code: "pi_process_exited",
+            message: "Pi stopped before the Turn completed.",
+            action: "none",
+          };
+        }
+        if (classified.needsInput) return { kind: "release" };
+        if (classified.settled) {
+          return assistantResults === 1
+            ? { kind: "succeeded" }
+            : {
+              kind: "failed",
+              code: "pi_result_missing",
+              message: "Pi settled without an assistant result.",
+              action: "none",
+            };
+        }
+        if (!page.hasMore && page.events.length === 0) {
+          await (options.wait ?? defaultWarmPollWait)();
+          signal?.throwIfAborted();
+        }
+      }
+      return {
+        kind: "failed",
+        code: "pi_settlement_missing",
+        message: "Pi did not produce a terminal result.",
+        action: "none",
+      };
+    } catch {
+      return {
+        kind: "failed",
+        code: "warm_turn_failed",
+        message: "The warm Turn could not be completed.",
+        action: "none",
+      };
+    }
+  };
+}
+
+async function defaultWarmPollWait(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 100));
+}
+
+/**
+ * Runtime v3 deep module. Production composes the warm text tracer bullet through this interface;
+ * callers never learn its lease, Pi admission, projection, or settlement choreography.
  */
 export function createRuntimeV3Progression(
   options: RuntimeV3ProgressionOptions,
@@ -165,16 +417,25 @@ export function createRuntimeV3Convergence(
   options: RuntimeV3ConvergenceOptions,
 ): RuntimeV3Convergence {
   return {
-    converge: async ({ executorId }) => {
+    converge: async ({ executorId, signal }) => {
       const lanes = await Promise.all(RUNTIME_V3_LANES.map(async (lane) => {
         let progressed = 0;
         while (progressed < LANE_CONVERGENCE_LIMIT) {
-          const claim = await options.persistence.claimLane({ executorId, lane });
+          if (signal?.aborted) return { progressed, exhausted: false };
+          const claim = await options.persistence.claimLane({ executorId, lane, signal });
+          if (signal?.aborted) return { progressed, exhausted: false };
           if (!claim) return { progressed, exhausted: false };
-          const outcome = durableOutcome(await options.advance(claim));
-          const completed = await options.persistence.completeProgression(claim, outcome);
+          const advanced = signal
+            ? await options.advance(claim, signal)
+            : await options.advance(claim);
+          const outcome = durableOutcome(advanced);
+          if (signal?.aborted) return { progressed, exhausted: false };
+          const completed = signal
+            ? await options.persistence.completeProgression(claim, outcome, signal)
+            : await options.persistence.completeProgression(claim, outcome);
           if (!completed) return { progressed, exhausted: false };
           progressed += 1;
+          if (outcome.kind === "release") return { progressed, exhausted: false };
         }
         return { progressed, exhausted: true };
       }));
