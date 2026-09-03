@@ -29,6 +29,8 @@ const RUNTIME_DATABASE_ROLE_MESSAGES = {
     "Runtime database role has an unexpected SECURITY DEFINER grant; reapply the runtime grants",
 } satisfies Record<RuntimeDatabaseRoleFailure, string>;
 
+const REQUIRED_PROTECTED_RELATION_COUNT = 19;
+
 export class RuntimeDatabaseRoleError extends Error {
   readonly failure: RuntimeDatabaseRoleFailure;
   readonly stableCode: string;
@@ -116,6 +118,10 @@ WITH runtime_role AS (
     ('public.companion_v3_runtime_claim(text,public.companion_v3_lane,integer,integer)'),
     ('public.companion_v3_runtime_claim_warm(text,public.companion_v3_lane,integer,integer)'),
     ('public.companion_v3_runtime_claim_preparation(text,integer,integer)'),
+    ('public.companion_v3_runtime_claim_lifecycle(text,integer,integer)'),
+    ('public.companion_v3_runtime_checkpoint_lifecycle(uuid,uuid,uuid,bigint,bigint,public.companion_v3_lifecycle_state,public.companion_v3_lifecycle_state,text,integer)'),
+    ('public.companion_v3_runtime_defer_lifecycle(uuid,uuid,uuid,bigint,bigint,integer,text,text,integer)'),
+    ('public.companion_v3_runtime_finalize_delete(uuid,uuid,uuid,bigint,bigint,integer)'),
     ('public.companion_v3_runtime_checkpoint_preparation(uuid,uuid,uuid,bigint,bigint,text,text,text,text,integer,bigint,integer,text,timestamp with time zone,integer)'),
     ('public.companion_v3_runtime_defer_preparation(uuid,uuid,uuid,bigint,bigint,integer,text,text,integer)'),
     ('public.companion_v3_runtime_reauthorize_preparation(uuid,uuid,uuid,bigint,bigint,text,integer,integer)'),
@@ -158,7 +164,8 @@ WITH runtime_role AS (
       'companion_message_attachments',
       'companion_v3_instances',
       'companion_v3_turns',
-      'companion_v3_lane_leases'
+      'companion_v3_lane_leases',
+      'companion_v3_lifecycle_requests'
     ]::text[])
 )
 SELECT
@@ -260,7 +267,10 @@ export async function verifyRuntimeDatabaseRole(
     || profile.ownsRelations !== false
     || profile.ownsFunctionsOrTypes !== false
   ) throw new RuntimeDatabaseRoleError("object_ownership");
-  if (profile.protectedRelationCount !== 18 || profile.requiredFunctionsReady !== true) {
+  if (
+    profile.protectedRelationCount !== REQUIRED_PROTECTED_RELATION_COUNT
+    || profile.requiredFunctionsReady !== true
+  ) {
     throw new RuntimeDatabaseRoleError("release_schema_incomplete");
   }
   if (profile.hasPublicRelationPrivileges !== false) {
