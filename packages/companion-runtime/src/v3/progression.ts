@@ -369,6 +369,9 @@ export interface RuntimeV3WarmTurnMaterial {
   recoveryDeferred?: boolean;
   /** Routine work runs in its own Pi session while sharing the durable Box workspace. */
   backgroundRoutine?: boolean;
+  backgroundKind?: "routine" | "trigger";
+  validationOnly?: boolean;
+  directWorkspace?: boolean;
   persona?: string | null;
 }
 
@@ -437,6 +440,8 @@ export interface RuntimeV3WarmPi {
     expectedInvocationId: string;
     message: string;
     persona?: string | null;
+    validationOnly?: boolean;
+    directWorkspace?: boolean;
     signal?: AbortSignal;
   }): Promise<
     | {
@@ -634,6 +639,8 @@ export function createRuntimeV3WarmTurnAdvance(
           expectedInvocationId: material.piInvocationId,
           message: material.content,
           persona: material.persona,
+          validationOnly: material.validationOnly,
+          directWorkspace: material.directWorkspace,
           signal: admissionSignal,
         });
         if (admission.outcome === "rejected") {

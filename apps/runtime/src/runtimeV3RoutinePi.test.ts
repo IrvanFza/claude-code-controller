@@ -42,6 +42,26 @@ function control(overrides: Partial<NonNullable<RuntimePiControl["routineSession
 }
 
 describe("Runtime v3 routine Pi adapter", () => {
+  it("starts trigger validation without skills, plugins, trusted workspace context, or control MCP", async () => {
+    const { pi, routine } = control();
+    const adapter = createRuntimeV3RoutinePi(pi);
+
+    await expect(adapter.prompt({
+      boxId,
+      turnId,
+      commandId,
+      expectedInvocationId: invocationId,
+      message: "External, untrusted webhook payload.",
+      persona: "A careful teammate.",
+      validationOnly: true,
+      directWorkspace: false,
+    })).resolves.toMatchObject({ outcome: "accepted", invocationId });
+    expect(routine.start).toHaveBeenCalledWith(expect.objectContaining({
+      validationOnly: true,
+      directWorkspace: false,
+    }));
+  });
+
   it("retries only a start failure proven clean before prompt dispatch", async () => {
     const start = vi.fn().mockRejectedValue(new Error("spawn failed"));
     const { pi, routine } = control({ start });
