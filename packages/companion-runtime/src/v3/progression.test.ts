@@ -356,6 +356,272 @@ describe("Runtime v3 progression interface", () => {
     expect(project.mock.calls[1]?.[1]).toMatchObject({ needsInput: false, activity: true });
   });
 
+  it("delivers one durable main ask_user answer before the active Turn resumes", async () => {
+    const respondExtensionUi = vi.fn().mockResolvedValue({
+      outcome: "accepted" as const,
+      invocationId: "invocation-1",
+    });
+    const finishDecisionAction = vi.fn().mockResolvedValue(true);
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1", content: "waiting", cursor: 0n,
+        }),
+        beginAdmission: vi.fn(),
+        recordAdmission: vi.fn(),
+        beginDecisionAction: vi.fn().mockResolvedValue({
+          kind: "respond", decisionId: "85312651-3171-4ac8-a99c-8af0875951aa",
+          commandId: "bfdd76e0-a78e-4fc7-8230-f4dfd3caf391",
+          response: { type: "extension_ui_response", id: "question-1", value: "Choose safe mode" },
+        }),
+        finishDecisionAction,
+        project: vi.fn().mockResolvedValue(true),
+      },
+      pi: {
+        prompt: vi.fn(), abort: vi.fn(), respondExtensionUi,
+        read: vi.fn().mockResolvedValue({
+          events: [], nextCursor: 0n, acknowledgedCursor: 0n, hasMore: false,
+        }),
+        acknowledge: vi.fn().mockResolvedValue(0n),
+      },
+    });
+    const claim = {
+      ...mainClaim,
+      turn: {
+        ...mainClaim.turn, state: "running" as const,
+        inactivityDeadlineAt: new Date(Date.now() + 60_000),
+        absoluteDeadlineAt: new Date(Date.now() + 120_000),
+      },
+    };
+
+    await expect(advance(claim)).resolves.toEqual({ kind: "release" });
+    expect(respondExtensionUi).toHaveBeenCalledOnce();
+    expect(respondExtensionUi).toHaveBeenCalledWith(expect.objectContaining({
+      turnId: claim.turn.id,
+      response: { type: "extension_ui_response", id: "question-1", value: "Choose safe mode" },
+    }));
+    expect(finishDecisionAction).toHaveBeenCalledOnce();
+  });
+
+  it.each(["no_active_attempt", "attempt_mismatch"])(
+    "checkpoints a proven-obsolete decision response (%s) before settling the terminal journal",
+    async (code) => {
+      const finishDecisionAction = vi.fn().mockResolvedValue(true);
+      const respondExtensionUi = vi.fn().mockResolvedValue({
+        outcome: "rejected" as const,
+        code,
+      });
+      const read = vi.fn().mockResolvedValue({
+        events: [
+          {
+            sequence: 1n, invocationId: "invocation-1", attemptId: acceptedTurn.id,
+            kind: "pi_event" as const,
+            event: {
+              type: "message_end" as const,
+              message: {
+                role: "assistant" as const,
+                content: [{ type: "text" as const, text: "Already settled." }],
+                stopReason: "stop" as const,
+              },
+            },
+          },
+          {
+            sequence: 2n, invocationId: "invocation-1", attemptId: acceptedTurn.id,
+            kind: "pi_event" as const, event: { type: "agent_settled" as const },
+          },
+        ],
+        nextCursor: 2n, acknowledgedCursor: 0n, hasMore: false,
+      });
+      const acknowledge = vi.fn().mockResolvedValue(2n);
+      const advance = createRuntimeV3WarmTurnAdvance({
+        persistence: {
+          authorize: vi.fn().mockResolvedValue({
+            boxId: "bx_23456789", piInvocationId: "invocation-1", content: "waiting", cursor: 0n,
+          }),
+          beginAdmission: vi.fn(), recordAdmission: vi.fn(),
+          beginDecisionAction: vi.fn().mockResolvedValue({
+            kind: "respond", decisionId: "85312651-3171-4ac8-a99c-8af0875951aa",
+            commandId: "bfdd76e0-a78e-4fc7-8230-f4dfd3caf391",
+            response: { type: "extension_ui_response", id: "question-1", value: "Proceed" },
+          }),
+          finishDecisionAction,
+          project: vi.fn().mockResolvedValue("succeeded"),
+        },
+        pi: { prompt: vi.fn(), respondExtensionUi, read, acknowledge },
+      });
+      const claim = { ...mainClaim, turn: { ...acceptedTurn, state: "running" as const } };
+
+      await expect(advance(claim)).resolves.toEqual({ kind: "ack_completed" });
+      expect(respondExtensionUi).toHaveBeenCalledOnce();
+      expect(finishDecisionAction).toHaveBeenCalledWith(claim, {
+        decisionId: "85312651-3171-4ac8-a99c-8af0875951aa",
+        kind: "obsolete",
+        invocationId: "invocation-1",
+      });
+      expect(read).toHaveBeenCalledOnce();
+      expect(acknowledge).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("keeps a transiently refused decision response reclaimable", async () => {
+    const finishDecisionAction = vi.fn();
+    const read = vi.fn();
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1", content: "waiting", cursor: 0n,
+        }),
+        beginAdmission: vi.fn(), recordAdmission: vi.fn(), project: vi.fn(),
+        beginDecisionAction: vi.fn().mockResolvedValue({
+          kind: "respond", decisionId: "85312651-3171-4ac8-a99c-8af0875951aa",
+          commandId: "bfdd76e0-a78e-4fc7-8230-f4dfd3caf391",
+          response: { type: "extension_ui_response", id: "question-1", value: "Proceed" },
+        }),
+        finishDecisionAction,
+      },
+      pi: {
+        prompt: vi.fn(), read, acknowledge: vi.fn(),
+        respondExtensionUi: vi.fn().mockResolvedValue({
+          outcome: "rejected" as const, code: "pi_decision_refused",
+        }),
+      },
+    });
+    const claim = { ...mainClaim, turn: { ...acceptedTurn, state: "running" as const } };
+
+    await expect(advance(claim)).resolves.toEqual({ kind: "release" });
+    expect(finishDecisionAction).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("releases a decision handoff whose durable begin reply was lost before Pi", async () => {
+    const respondExtensionUi = vi.fn();
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1", content: "waiting", cursor: 0n,
+        }),
+        beginAdmission: vi.fn(), recordAdmission: vi.fn(), project: vi.fn(),
+        beginDecisionAction: vi.fn().mockRejectedValue(new Error("commit reply lost")),
+        finishDecisionAction: vi.fn(),
+      },
+      pi: { prompt: vi.fn(), read: vi.fn(), acknowledge: vi.fn(), respondExtensionUi },
+    });
+    const claim = { ...mainClaim, turn: { ...acceptedTurn, state: "running" as const } };
+
+    await expect(advance(claim)).resolves.toEqual({ kind: "release" });
+    expect(respondExtensionUi).not.toHaveBeenCalled();
+  });
+
+  it("terminalizes an ambiguous decision write instead of replaying it", async () => {
+    const respondExtensionUi = vi.fn(async () => {
+      throw new Error("ledger fsync failed after the send");
+    });
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1", content: "waiting", cursor: 0n,
+        }),
+        beginAdmission: vi.fn(), recordAdmission: vi.fn(), project: vi.fn(),
+        beginDecisionAction: vi.fn().mockResolvedValue({
+          kind: "respond", decisionId: "85312651-3171-4ac8-a99c-8af0875951aa",
+          commandId: "bfdd76e0-a78e-4fc7-8230-f4dfd3caf391",
+          response: { type: "extension_ui_response", id: "question-1", value: "Proceed" },
+        }),
+        finishDecisionAction: vi.fn(),
+      },
+      pi: { prompt: vi.fn(), read: vi.fn(), acknowledge: vi.fn(), respondExtensionUi },
+    });
+    const claim = { ...mainClaim, turn: { ...acceptedTurn, state: "running" as const } };
+
+    await expect(advance(claim)).resolves.toMatchObject({
+      kind: "decision_ambiguous", code: "pi_decision_outcome_unknown",
+    });
+    expect(respondExtensionUi).toHaveBeenCalledOnce();
+  });
+
+  it("completes a durably detached background Turn after its checkpoint reply is lost", async () => {
+    const abort = vi.fn().mockResolvedValue({
+      outcome: "accepted" as const, invocationId: "invocation-1",
+    });
+    const beginDecisionAction = vi.fn()
+      .mockResolvedValueOnce({
+        kind: "detach", decisionId: "85312651-3171-4ac8-a99c-8af0875951aa",
+        commandId: "bfdd76e0-a78e-4fc7-8230-f4dfd3caf391", response: null,
+      })
+      .mockResolvedValueOnce({
+        kind: "complete_detached", decisionId: "85312651-3171-4ac8-a99c-8af0875951aa",
+        commandId: "85312651-3171-4ac8-a99c-8af0875951aa", response: null,
+      });
+    const persistence = {
+      authorize: vi.fn().mockResolvedValue({
+        boxId: "bx_23456789", piInvocationId: "invocation-1", content: "background", cursor: 0n,
+      }),
+      beginAdmission: vi.fn(), recordAdmission: vi.fn(), project: vi.fn(),
+      beginDecisionAction,
+      finishDecisionAction: vi.fn().mockRejectedValueOnce(new Error("checkpoint reply lost")),
+    };
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence,
+      pi: { prompt: vi.fn(), read: vi.fn(), acknowledge: vi.fn(), abort },
+    });
+    const claim = {
+      ...mainClaim,
+      turn: { ...acceptedTurn, lane: "background" as const, state: "needs_input" as const },
+    };
+
+    await expect(advance(claim)).resolves.toEqual({ kind: "release" });
+    await expect(advance(claim)).resolves.toEqual({ kind: "detached" });
+    expect(abort).toHaveBeenCalledOnce();
+  });
+
+  it("aborts a background Turn after persisting its detached ask_user identity", async () => {
+    const turn = { ...acceptedTurn, lane: "background" as const };
+    const claim = { ...mainClaim, turn };
+    const beginDecisionAction = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        kind: "detach", decisionId: "85312651-3171-4ac8-a99c-8af0875951aa",
+        commandId: "bfdd76e0-a78e-4fc7-8230-f4dfd3caf391", response: null,
+      });
+    const project = vi.fn().mockResolvedValue("detached");
+    const abort = vi.fn().mockResolvedValue({ outcome: "accepted" as const, invocationId: "invocation-1" });
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1", content: "background", cursor: 0n,
+        }),
+        beginAdmission: vi.fn().mockResolvedValue(true),
+        recordAdmission: vi.fn().mockResolvedValue(true),
+        beginDecisionAction,
+        finishDecisionAction: vi.fn().mockResolvedValue(true),
+        project,
+      },
+      pi: {
+        prompt: vi.fn().mockResolvedValue({
+          outcome: "accepted" as const, invocationId: "invocation-1", initialCursor: 0n,
+        }),
+        read: vi.fn().mockResolvedValue({
+          events: [{
+            sequence: 1n, invocationId: "invocation-1", attemptId: turn.id,
+            kind: "pi_event", event: {
+              type: "extension_ui_request", id: "question-1", method: "input",
+              title: "companion:question:ask_user", message: "Choose a safe mode",
+            },
+          }],
+          nextCursor: 1n, acknowledgedCursor: 0n, hasMore: false,
+        }),
+        acknowledge: vi.fn().mockResolvedValue(1n), abort, respondExtensionUi: vi.fn(),
+      },
+    });
+
+    await expect(advance(claim)).resolves.toEqual({ kind: "detached" });
+    expect(project).toHaveBeenCalledWith(claim, expect.objectContaining({
+      needsInput: true,
+      decisions: [expect.objectContaining({ request_key: "question-1", request_kind: "question" })],
+    }), expect.any(AbortSignal));
+    expect(abort).toHaveBeenCalledOnce();
+  });
+
   it("archives, resumes, and permanently deletes only the persistent Box", async () => {
     const lifecycleBase = {
       executorId: "runtime-lifecycle",
