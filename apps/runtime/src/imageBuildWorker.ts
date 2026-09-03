@@ -1,4 +1,4 @@
-/* oxlint-disable anti-slop/no-unknown-parameters -- Failure reporting receives unknown thrown values at this process boundary and redacts them into bounded messages. */
+/* oxlint-disable anti-slop/no-unknown-parameters -- Failure reporting receives unknown thrown values at this process boundary and replaces them with fixed expurgated messages. */
 import {
   bakeCompanionRuntimeImageOnce,
   deleteCompanionRuntimeBakerBox,
@@ -12,7 +12,6 @@ import {
   IMAGE_BUILD_BACKOFF_MS,
 } from "@companion/companion-runtime";
 import type { RuntimeProcessLog } from "@companion/companion-runtime";
-import { COMPANION_BUDGETS_BASE } from "@companion/contracts";
 
 import type { RuntimeImageSource } from "./boxAdapters";
 
@@ -23,19 +22,14 @@ export const IMAGE_BUILD_POLL_INTERVAL_MS = 5_000;
  * bounded, but their sequence is not: this budget guarantees a wedged attempt can never
  * hold the build lease forever — the attempt fails closed and the backoff takes over.
  */
-export const IMAGE_BUILD_ATTEMPT_BUDGET_MS = 20 * 60_000;
+export const IMAGE_BUILD_ATTEMPT_BUDGET_MS = 40 * 60_000;
 /** Independent cleanup budget; it intentionally survives an expired bake signal. */
 export const IMAGE_BUILD_CLEANUP_BUDGET_MS = 2 * 60_000;
-/**
- * Absolute safety ceiling on one `waitForResolution` call. The caller passes the real bound
- * (derived from the operation's cold-start deadline in {@link ../boxAdapters}); this ceiling only
- * caps a pathological caller value. It is the cold-start budget itself — a create can never sanely
- * wait for a snapshot longer than the whole turn is allowed to start — so it is derived from
- * `COMPANION_BUDGETS_BASE.coldStartDeadlineMs`, never the old hidden 3s clamp that made the
- * caller's 60s bound dead and forced almost every create onto the 300s cold install.
- */
-export const IMAGE_RESOLUTION_CEILING_MS = COMPANION_BUDGETS_BASE.coldStartDeadlineMs;
-const RESOLUTION_POLL_INTERVAL_MS = 1_000;
+
+const IMAGE_BUILD_FAILURE_MESSAGE = "The runtime image build attempt failed.";
+const IMAGE_BUILD_TIMEOUT_MESSAGE = "The runtime image build attempt exceeded its budget.";
+const IMAGE_BUILD_CLEANUP_FAILURE_MESSAGE = "The runtime image build cleanup failed.";
+const IMAGE_BUILD_WORKER_FAILURE_MESSAGE = "The runtime image builder iteration failed.";
 
 export interface ImageBuildWorkerOptions {
   registry: CompanionImageRegistry;
@@ -48,7 +42,6 @@ export interface ImageBuildWorkerOptions {
   executorId: string;
   log: RuntimeProcessLog;
   pollIntervalMs?: number;
-  resolutionBoundMs?: number;
   attemptBudgetMs?: number;
   cleanupBudgetMs?: number;
   now?: () => number;
@@ -71,12 +64,8 @@ export function createImageBuildWorker(options: ImageBuildWorkerOptions): ImageB
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? defaultSleep;
   const pollIntervalMs = options.pollIntervalMs ?? IMAGE_BUILD_POLL_INTERVAL_MS;
-  const resolutionCeilingMs = options.resolutionBoundMs ?? IMAGE_RESOLUTION_CEILING_MS;
   const attemptBudgetMs = options.attemptBudgetMs ?? IMAGE_BUILD_ATTEMPT_BUDGET_MS;
   const cleanupBudgetMs = options.cleanupBudgetMs ?? IMAGE_BUILD_CLEANUP_BUDGET_MS;
-  // In-process clone hints: the last ready image and its parent remain valid clone sources
-  // while a newer digest builds. Purely an optimization; correctness comes from the registry.
-  let lastCloneName: string | null = null;
 
   async function run(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
@@ -130,6 +119,16 @@ export function createImageBuildWorker(options: ImageBuildWorkerOptions): ImageB
             });
             if (!marked) throw new Error("The image build lease was lost after Box creation.");
           },
+          onBeforeSnapshotPublish: async ({ boxId }) => {
+            const authorized = await options.registry.authorizeSnapshotPublication({
+              digest: claim.digest,
+              claimEpoch: claim.claimEpoch,
+              buildBoxId: boxId,
+            });
+            if (!authorized) {
+              throw new Error("The image build lease was lost before snapshot publication.");
+            }
+          },
           onBoxDeleted: async ({ boxId }) => {
             const cleared = await options.registry.clearBuildingBox({
               digest: claim.digest,
@@ -160,13 +159,14 @@ export function createImageBuildWorker(options: ImageBuildWorkerOptions): ImageB
             }
           },
           onCleanupError: (error) => {
+            void error;
             options.log.warn({
               ts: new Date(now()).toISOString(),
               event: "runtime.image_build_cleanup_failed",
               digest: claim.digest,
               buildBoxId: claim.buildBoxId,
               buildDeleteOperationId: claim.buildDeleteOperationId,
-              error: describeError(error),
+              error: IMAGE_BUILD_CLEANUP_FAILURE_MESSAGE,
             });
           },
         };
@@ -196,7 +196,10 @@ export function createImageBuildWorker(options: ImageBuildWorkerOptions): ImageB
             if (options.bundledSkill) {
               bakeInput.bundledSkill = options.bundledSkill;
             }
-            const baked = await bake(bakeInput);
+            const baked = await waitForBakeWithinBudget(
+              () => bake(bakeInput),
+              attemptController.signal,
+            );
             if (!baked.ready) {
               throw new Error("The runtime image snapshot did not become ready.");
             }
@@ -207,7 +210,6 @@ export function createImageBuildWorker(options: ImageBuildWorkerOptions): ImageB
               imageName: claim.imageName,
               parentImageName: baked.parentImageName,
             });
-            if (outcome === "ready") lastCloneName = claim.imageName;
           }
         } catch (error) {
           clearTimeout(budgetTimer);
@@ -219,7 +221,7 @@ export function createImageBuildWorker(options: ImageBuildWorkerOptions): ImageB
             claimEpoch: claim.claimEpoch,
             kind: "failed",
             errorCode: timedOut ? "image_build_timeout" : "image_build_failed",
-            errorMessage: describeError(error),
+            errorMessage: timedOut ? IMAGE_BUILD_TIMEOUT_MESSAGE : IMAGE_BUILD_FAILURE_MESSAGE,
           });
           options.log.warn({
             ts: new Date(now()).toISOString(),
@@ -230,7 +232,7 @@ export function createImageBuildWorker(options: ImageBuildWorkerOptions): ImageB
             retryBackoffMs: claim.attemptCount >= 4
               ? null
               : IMAGE_BUILD_BACKOFF_MS[claim.attemptCount - 1] ?? null,
-            error: describeError(error),
+            error: timedOut ? IMAGE_BUILD_TIMEOUT_MESSAGE : IMAGE_BUILD_FAILURE_MESSAGE,
           });
         }
         clearTimeout(budgetTimer);
@@ -248,7 +250,7 @@ export function createImageBuildWorker(options: ImageBuildWorkerOptions): ImageB
         options.log.warn({
           ts: new Date(now()).toISOString(),
           event: "runtime.image_build_worker_error",
-          error: describeError(error),
+          error: IMAGE_BUILD_WORKER_FAILURE_MESSAGE,
         });
         await sleep(pollIntervalMs, signal);
       }
@@ -265,21 +267,17 @@ export function createImageBuildWorker(options: ImageBuildWorkerOptions): ImageB
   function source(): RuntimeImageSource {
     return {
       expectedName: () => options.identity.imageName,
-      cloneName: () => lastCloneName,
-      async waitForResolution(boundMs, signal): Promise<"ready" | "failed" | "pending"> {
-        // Honor the caller's bound; only the absolute safety ceiling clamps it (never a hidden 3s).
-        const ceiling = Math.min(Math.max(boundMs, 0), resolutionCeilingMs);
-        const deadline = now() + ceiling;
-        // Read the terminal status at least once before parking: `ready` and `failed` short-circuit
-        // immediately even at a zero bound, so a settled build never pays a poll interval.
-        for (;;) {
-          signal.throwIfAborted();
-          const image = await options.registry.getByDigest(options.identity.imageMarker);
-          if (image?.status === "ready") return "ready";
-          if (image?.status === "failed") return "failed";
-          if (now() >= deadline) return "pending";
-          await sleep(RESOLUTION_POLL_INTERVAL_MS, signal);
-        }
+      async availability(signal) {
+        signal.throwIfAborted();
+        const image = await options.registry.getByDigest(options.identity.imageMarker);
+        signal.throwIfAborted();
+        if (!image) return "missing";
+        if (
+          image.status === "building"
+          && image.leaseExpiresAt !== null
+          && image.leaseExpiresAt.getTime() <= now()
+        ) return "stale";
+        return image.status;
       },
     };
   }
@@ -343,10 +341,20 @@ async function cleanupClaimedBox(input: {
   }
 }
 
-function describeError(error: unknown): string {
-  return error instanceof Error && error.message.length > 0
-    ? error.message.slice(0, 500)
-    : "The image build failed without a message.";
+async function waitForBakeWithinBudget<T>(bake: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(
+      signal.reason instanceof Error ? signal.reason : new Error(IMAGE_BUILD_TIMEOUT_MESSAGE),
+    );
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([bake(), aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {

@@ -485,9 +485,9 @@ export function createRuntimeV3Preparation(
               generation: 1n,
               ttlSeconds: PREPARATION_BOX_TTL_SECONDS,
               idempotencyKey: claim.boxIdempotencyKey,
-              // Preparation owns no user-facing operation deadline. Use a ready image if already
-              // published, but never spend this fenced claim waiting for the image builder.
-              imageWaitDeadlineAt: now(),
+              // Preparation owns no user-facing operation deadline. The signal bounds the whole
+              // claim, while this bound lets an unknown-snapshot fallback take a fresh create slot.
+              workDeadlineAt: new Date(now().getTime() + 60_000),
               signal,
             });
             if (!await options.persistence.checkpoint(claim, {
