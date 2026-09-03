@@ -1,12 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { BoxRuntimeAdapterError } from "@companion/box-runtime";
 
 import {
+  companionV2BoxPresent,
   collectCompanionV2ObjectKeys,
   assertCompanionV2PurgeDisabled,
   mergeCompanionV2PurgeTargets,
   parseCompanionV2PurgeArgs,
   processCompanionV2PurgeTargets,
+  removeCompanionV2BoxTarget,
   type CompanionV2PurgeJournal,
   type CompanionV2PurgeTarget,
 } from "./companionV2Purge";
@@ -281,8 +283,9 @@ describe("Runtime v2 external purge checkpoints", () => {
     expect({ effects, outcomes }).toEqual({ effects: [], outcomes: ["absent"] });
   });
 
-  it("polls a durable Box operation even after the Box leaves ordinary inventory", async () => {
+  it("settles a resumed durable Box operation when fresh inventory proves absence", async () => {
     const effects: string[] = [];
+    const outcomes: Array<{ outcome: string; operationId: string | null | undefined }> = [];
     await processCompanionV2PurgeTargets({
       targets: [{
         kind: "box",
@@ -293,7 +296,9 @@ describe("Runtime v2 external purge checkpoints", () => {
       }],
       journal: {
         async markRequesting() {},
-        async markComplete() {},
+        async markComplete(target, outcome) {
+          outcomes.push({ outcome, operationId: target.operationId });
+        },
         async markFailure() {},
       },
       providerPresent: () => false,
@@ -302,10 +307,126 @@ describe("Runtime v2 external purge checkpoints", () => {
         return "completed";
       },
     });
-    expect(effects).toEqual(["bdop_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]);
+    expect(effects).toEqual([]);
+    expect(outcomes).toEqual([{
+      outcome: "absent",
+      operationId: "bdop_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }]);
   });
 
-  it("fails closed before a requesting effect when authenticated reconciliation fails", async () => {
+  it("settles a newly accepted Box deletion after checkpoint when inventory proves absence", async () => {
+    const operationId = "bdop_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const checkpoints: string[] = [];
+    const boxClient = {
+      requestPermanentDeletion: async () => ({
+        outcome: "accepted" as const,
+        operation: {
+          id: operationId,
+          targetId: "bx_newly_admitted",
+          status: "blocked" as const,
+          attemptCount: 1,
+          requestedAt: new Date(0).toISOString(),
+          completedAt: null,
+        },
+      }),
+      listAllBoxes: async () => [],
+      getDeletionOperation: async () => {
+        throw new Error("operation polling must not run after authoritative absence");
+      },
+    };
+
+    await expect(removeCompanionV2BoxTarget({
+      target: {
+        kind: "box",
+        key: "bx_newly_admitted",
+        evidence: ["provider-name:companion-generation"],
+      },
+      journal: {
+        async markRequesting() {},
+        async markAbsent() {},
+        async markOperation(_boxId, operation) { checkpoints.push(operation.id); },
+        async markError() {},
+      },
+      boxClient,
+    })).resolves.toBe("absent");
+    expect(checkpoints).toEqual([operationId]);
+  });
+
+  it("settles when a Box disappears during nonterminal operation polling", async () => {
+    vi.useFakeTimers();
+    try {
+      const operationId = "bdop_dddddddddddddddddddddddddddddddd";
+      const operationCheckpoints: string[] = [];
+      let inventoryReads = 0;
+      let operationReads = 0;
+      const removal = removeCompanionV2BoxTarget({
+        target: {
+          kind: "box",
+          key: "bx_delayed_absence",
+          evidence: ["provider-name:companion-generation"],
+        },
+        journal: {
+          async markRequesting() {},
+          async markAbsent() {},
+          async markOperation(_boxId, operation) {
+            operationCheckpoints.push(operation.id);
+          },
+          async markError() {},
+        },
+        boxClient: {
+          async requestPermanentDeletion() {
+            return {
+              outcome: "accepted" as const,
+              operation: {
+                id: operationId,
+                targetId: "bx_delayed_absence",
+                status: "pending" as const,
+                attemptCount: 0,
+                requestedAt: new Date(0).toISOString(),
+                completedAt: null,
+              },
+            };
+          },
+          async listAllBoxes() {
+            inventoryReads += 1;
+            return inventoryReads === 1 ? [{ id: "bx_delayed_absence" }] : [];
+          },
+          async getDeletionOperation() {
+            operationReads += 1;
+            return {
+              id: operationId,
+              targetId: "bx_delayed_absence",
+              status: "blocked" as const,
+              attemptCount: 1,
+              requestedAt: new Date(0).toISOString(),
+              completedAt: null,
+            };
+          },
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(removal).resolves.toBe("absent");
+      expect({ inventoryReads, operationReads, operationCheckpoints }).toEqual({
+        inventoryReads: 2,
+        operationReads: 1,
+        operationCheckpoints: [operationId, operationId],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails closed on unavailable or malformed Box reconciliation reads", async () => {
+    await expect(companionV2BoxPresent({
+      listAllBoxes: async () => { throw new Error("authenticated Box inventory unavailable"); },
+    }, "bx_unknown")).rejects.toThrow("authenticated Box inventory unavailable");
+    await expect(companionV2BoxPresent({
+      listAllBoxes: async () => null,
+    }, "bx_unknown")).rejects.toThrow("Box inventory returned a malformed response");
+  });
+
+  it("fails closed before polling a recorded operation when reconciliation fails", async () => {
     const events: string[] = [];
     await expect(processCompanionV2PurgeTargets({
       targets: [{
@@ -313,7 +434,7 @@ describe("Runtime v2 external purge checkpoints", () => {
         key: "bx_unknown",
         evidence: ["database:runtime-instance"],
         state: "requesting",
-        operationId: null,
+        operationId: "bdop_cccccccccccccccccccccccccccccccc",
       }],
       journal: {
         async markRequesting() { events.push("requesting"); },
