@@ -6,6 +6,10 @@
 > contract. V3 has one Turn carrying command/admission/activity/outcome facts, independent
 > `main`/`background` leases, no attempt table, and no derived Start operation. Its protocol-3
 > functions remain behind forced RLS, split role grants, and the existing runtime kill switch.
+>
+> Runtime v3 purge note (THE-511): migration 0160 and the dedicated runtime maintenance command add
+> a dormant, one-shot path that can remove Runtime v2 state before a later cutover. This ticket
+> builds and tests the path only; it does not execute a production purge or wire v3 into a service.
 
 This document is the normative, as-built Runtime v2 Box/Pi contract. Companion remains a Skills Hub
 at its core; the optional Companions surface adds one bounded hosted shape. The guarded cutover
@@ -1407,6 +1411,61 @@ The stacked rollout retained legacy columns solely for deployability and never b
 final migration removes them; its release gate requires no open P0/P1 runtime issue and no resource
 remaining in the purge report. The immutable purge ledger remains owner-readable evidence; its
 mutating finalizer no longer exists.
+
+## Runtime v2 purge before Runtime v3
+
+The successor purge is a separate command and ledger; the historical pre-v2 command above remains
+unchanged for migration replay. `node dist/companionV2Purge.js report` and `purge --dry-run` enumerate
+all Companion rows, registered remote triggers, `companion-attachments/` objects, exact runtime
+named snapshots, image-build Boxes, duplicate Boxes, and generation-qualified Companion Boxes.
+They perform no database or provider mutation and do not load or decrypt reusable credentials.
+
+Destructive mode accepts only `purge --confirm-delete-all-companions`. Before its first ledger write
+or external call, it requires `COMPANION_COMPANIONS_ENABLED=false`, the `runtime-v2` PostgreSQL gate
+disabled, neutral v2 and v3 leases, and the migration advisory lock. External ownership is removed
+first. A provider's authoritative absence result is recorded as `absent`; every unresolved failure
+stops with ownership rows present. For GitHub and Sentry triggers, a hook-item `404` is not
+authoritative because it can also mean that the parent repository or project is inaccessible. The
+purge instead walks the complete authenticated parent hook list and treats a list failure, including
+`404`, as unknown. GitHub and Sentry `Link` pagination accepts only a complete parameter grammar,
+with one supported relation per link encoded as either a token such as `rel=next` or a quoted value
+such as `rel="next"`. Every page URI must be absolute HTTPS at the authenticated list's exact origin
+and path; duplicate or contradictory relations, malformed parameters or quoting, repeated pages,
+cycles, and traversal beyond 100 pages are unknown evidence and fail closed. Terminal targets are
+skipped on retry. Sentry's
+[documented pagination contract](https://docs.sentry.io/api/pagination/) always exposes a `next`
+cursor, so that link must carry exactly one boolean `results` parameter: `false` is authoritative
+end-of-list and only `true` advances to the cursor. GitHub does not require that Sentry-specific
+parameter. A recorded Box operation is polled rather than resubmitted. A nonterminal retry performs an
+authoritative provider observation first:
+storage/Box/snapshot inventory covers those resources, and complete authenticated GitHub, Linear,
+or Sentry lookup covers remote triggers. Proven absence closes the target without another DELETE; an
+operation-bearing Box resumes by polling. Without an operation id, fresh authenticated Box absence
+closes the target without replay, while fresh visibility proves the provider's documented
+immediate-removal admission boundary was not crossed and permits a new request. An unavailable or
+unknown observation fails closed; known-negative DELETE rejection is retried only after backoff.
+Automatic trigger registrations whose create may have committed before `remote_hook_id` was saved
+remain purge targets whenever their provider account is still owned. Report and dry-run inventory
+their provider, account, and non-secret locator without selecting or serializing the callback
+credential, decrypting provider credentials, or calling the provider. Only after the destructive
+feature-flag, lock, and lease guards pass does the runtime require `COMPANION_WEB_URL` to be the
+exact public HTTP(S) origin used at registration. Missing, credential-bearing, path-bearing, or
+otherwise malformed configuration fails before the ledger, master key, provider credentials, or
+external effects. The runtime then loads the master key and reconstructs the exact callback from
+the authorized trigger row. Destructive inspection and removal each
+re-enumerate the authenticated provider list to resolve that exact callback before DELETE; a crash
+before or ambiguously after DELETE therefore repeats observation, not the effect. Finalization
+repeats the callback lookup and requires fresh authoritative absence.
+
+Only a complete external ledger admits the final transaction. It drains Companions, ACLs, threads,
+Turns, attempts, operations, routines, triggers, leases, runtime projections, images/build state,
+notifications, attachment metadata/outbox rows, and Companion-scoped bearer tokens. The ledger then
+becomes immutable and retains only identifier-level, expurgated evidence. A database-generated
+before/after fingerprint is captured under preserved-table locks immediately around the final SQL
+deletion, so legitimate Skills Hub writes during a long provider cleanup do not poison resume. It
+proves organizations, users, memberships, Skills, Skill secrets, Skill
+Databases, billing, audit history, encrypted provider connections, member MCP accounts, trigger
+provider credentials, and plugin trigger keys are unchanged.
 
 ## Health, observability, and acceptance
 

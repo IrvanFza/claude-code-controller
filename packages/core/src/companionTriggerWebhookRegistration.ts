@@ -256,9 +256,10 @@ const LINEAR_DELETE_MUTATION = `
 `;
 
 const LINEAR_LIST_QUERY = `
-  query CompanionWebhooks {
-    webhooks {
+  query CompanionWebhooks($after: String) {
+    webhooks(first: 100, after: $after) {
       nodes { id url }
+      pageInfo { hasNextPage endCursor }
     }
   }
 `;
@@ -299,25 +300,58 @@ async function findLinearWebhook(input: {
   fetch: typeof globalThis.fetch;
   token: string;
   webhookUrl: string;
+  remoteHookId?: string;
 }): Promise<string | null> {
-  const response = await input.fetch(LINEAR_API, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: input.token.trim() },
-    body: JSON.stringify({ query: LINEAR_LIST_QUERY }),
-  });
-  const payload = z.object({
-    data: z.object({
-      webhooks: z.object({ nodes: z.array(z.object({ id: z.string(), url: z.string() })) }),
-    }).optional(),
-    errors: z.array(z.object({ message: z.string() })).optional(),
-  }).safeParse(await response.json().catch(() => null));
-  if (!response.ok || !payload.success || payload.data.errors?.length || !payload.data.data) {
-    throw new CompanionTriggerRegistrationError(
-      "provider_rejected",
-      `linear webhook reconciliation failed (${response.status})`,
+  const seen = new Set<string>();
+  let foundId: string | null = null;
+  let after: string | null = null;
+  for (;;) {
+    const response = await input.fetch(LINEAR_API, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: input.token.trim() },
+      body: JSON.stringify({ query: LINEAR_LIST_QUERY, variables: { after } }),
+    });
+    const payload = z.object({
+      data: z.object({
+        webhooks: z.object({
+          nodes: z.array(z.object({ id: z.string(), url: z.string() })),
+          pageInfo: z.object({
+            hasNextPage: z.boolean(),
+            endCursor: z.string().nullable(),
+          }),
+        }),
+      }).optional(),
+      errors: z.array(z.object({ message: z.string() })).optional(),
+    }).safeParse(await response.json().catch(() => null));
+    if (!response.ok || !payload.success || payload.data.errors?.length || !payload.data.data) {
+      throw new CompanionTriggerRegistrationError(
+        "provider_rejected",
+        `linear webhook reconciliation failed (${response.status})`,
+      );
+    }
+    const matches = payload.data.data.webhooks.nodes.filter(
+      (candidate) => input.remoteHookId
+        ? candidate.id === input.remoteHookId
+        : candidate.url === input.webhookUrl,
     );
+    if (matches.length > 1 || (foundId && matches.length > 0)) {
+      throw new CompanionTriggerRegistrationError(
+        "provider_rejected",
+        "linear webhook reconciliation returned duplicate registrations",
+      );
+    }
+    if (matches[0]) foundId = matches[0].id;
+    const pageInfo = payload.data.data.webhooks.pageInfo;
+    if (!pageInfo.hasNextPage) return foundId;
+    if (!pageInfo.endCursor || seen.has(pageInfo.endCursor)) {
+      throw new CompanionTriggerRegistrationError(
+        "provider_rejected",
+        "linear webhook reconciliation returned invalid pagination",
+      );
+    }
+    seen.add(pageInfo.endCursor);
+    after = pageInfo.endCursor;
   }
-  return payload.data.data.webhooks.nodes.find((candidate) => candidate.url === input.webhookUrl)?.id ?? null;
 }
 
 async function findSentryWebhook(input: {
@@ -338,6 +372,281 @@ async function findSentryWebhook(input: {
     );
   }
   return hooks.data.find((candidate) => candidate.url === input.webhookUrl)?.id ?? null;
+}
+
+const PROVIDER_WEBHOOK_PAGE_LIMIT = 100;
+const LINK_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const SUPPORTED_LINK_RELATIONS = new Set(["first", "last", "next", "previous"]);
+
+function malformedProviderPagination(provider: "github" | "Sentry", detail: string): never {
+  throw new CompanionTriggerRegistrationError(
+    "provider_rejected",
+    `${provider} webhook reconciliation returned malformed pagination ${detail}`,
+  );
+}
+
+function parseProviderLinkParameterValue(
+  provider: "github" | "Sentry",
+  rawValue: string,
+): string {
+  if (LINK_TOKEN.test(rawValue)) return rawValue;
+  // Accepted Link grammar is intentionally narrower than RFC 8288: provider pagination values may
+  // be a token or a non-empty quoted visible-ASCII string without escapes or delimiters. Anything
+  // outside that grammar is unknown evidence and must not be interpreted as end-of-list.
+  const quoted = /^"([^"\\;,]+)"$/.exec(rawValue);
+  if (quoted && ![...quoted[1]!].some((character) => {
+    const codePoint = character.codePointAt(0)!;
+    return codePoint < 0x20 || codePoint === 0x7f;
+  })) return quoted[1]!;
+  return malformedProviderPagination(provider, "parameter value");
+}
+
+function isProviderPaginationPath(input: {
+  provider: "github" | "Sentry";
+  currentPath: string;
+  candidatePath: string;
+}): boolean {
+  if (input.candidatePath === input.currentPath) return true;
+  return input.provider === "github"
+    && /^\/repos\/[^/]+\/[^/]+\/hooks$/.test(input.currentPath)
+    && /^\/repositories\/[1-9]\d*\/hooks$/.test(input.candidatePath);
+}
+
+function providerNextPageUrl(input: {
+  response: Response;
+  currentUrl: string;
+  provider: "github" | "Sentry";
+  seenUrls: ReadonlySet<string>;
+}): string | null {
+  const link = input.response.headers.get("link");
+  if (!link) {
+    if (input.provider === "Sentry") {
+      return malformedProviderPagination(input.provider, "missing link header");
+    }
+    return null;
+  }
+  let next: string | null = null;
+  let nextHasResults: boolean | null = null;
+  const seenRelations = new Set<string>();
+  const current = new URL(input.currentUrl);
+  for (const rawPart of link.split(",")) {
+    const part = /^\s*<([^<>,\s]+)>((?:\s*;\s*[^;,]+)+)\s*$/.exec(rawPart);
+    if (!part) return malformedProviderPagination(input.provider, "link value");
+    let relation: string | null = null;
+    let results: string | null = null;
+    const parameterNames = new Set<string>();
+    for (const rawParameter of part[2]!.split(";").slice(1)) {
+      const parameter = /^\s*([!#$%&'*+\-.^_`|~0-9A-Za-z]+)\s*=\s*(.+?)\s*$/.exec(rawParameter);
+      if (!parameter) return malformedProviderPagination(input.provider, "parameter");
+      const name = parameter[1]!.toLowerCase();
+      if (parameterNames.has(name)) return malformedProviderPagination(input.provider, "duplicate parameter");
+      parameterNames.add(name);
+      const value = parseProviderLinkParameterValue(input.provider, parameter[2]!);
+      if (name === "rel") {
+        const relations = value.toLowerCase().split(/\s+/).map((item) =>
+          item === "prev" ? "previous" : item);
+        if (relations.length !== 1 || !SUPPORTED_LINK_RELATIONS.has(relations[0]!)) {
+          return malformedProviderPagination(input.provider, "relation");
+        }
+        relation = relations[0]!;
+      } else if (name === "results") {
+        results = value;
+      }
+    }
+    if (!relation) return malformedProviderPagination(input.provider, "missing relation");
+    if (seenRelations.has(relation)) return malformedProviderPagination(input.provider, "duplicate relation");
+    seenRelations.add(relation);
+    let hasResults: boolean | null = null;
+    if (input.provider === "Sentry" && relation === "next") {
+      const normalizedResults = results?.toLowerCase();
+      if (normalizedResults !== "true" && normalizedResults !== "false") {
+        return malformedProviderPagination(input.provider, "results marker");
+      }
+      hasResults = normalizedResults === "true";
+    }
+    let candidate: URL;
+    try {
+      if (!part[1]!.startsWith("https://")) return malformedProviderPagination(input.provider, "URI");
+      candidate = new URL(part[1]!);
+    } catch {
+      return malformedProviderPagination(input.provider, "URI");
+    }
+    if (
+      candidate.protocol !== "https:"
+      || candidate.username !== ""
+      || candidate.password !== ""
+      || candidate.hash !== ""
+      || candidate.origin !== current.origin
+      || !isProviderPaginationPath({
+        provider: input.provider,
+        currentPath: current.pathname,
+        candidatePath: candidate.pathname,
+      })
+    ) return malformedProviderPagination(input.provider, "URI boundary");
+    if (relation !== "next") continue;
+    if (next) return malformedProviderPagination(input.provider, "ambiguous next relation");
+    next = candidate.toString();
+    nextHasResults = hasResults;
+  }
+  if (!next) {
+    if (input.provider === "Sentry") {
+      return malformedProviderPagination(input.provider, "missing next relation");
+    }
+    return null;
+  }
+  // Sentry always emits a next cursor. Its documented `results` marker, not cursor presence,
+  // determines whether another authenticated page exists.
+  if (input.provider === "Sentry" && nextHasResults === false) return null;
+  if (input.seenUrls.has(next)) return malformedProviderPagination(input.provider, "cycle");
+  return next;
+}
+
+async function findWebhookFromProviderList<T>(input: {
+  fetch: typeof globalThis.fetch;
+  initialUrl: string;
+  headers: Record<string, string>;
+  provider: "github" | "Sentry";
+  schema: z.ZodType<T>;
+  matches: (hook: T) => boolean;
+  idOf: (hook: T) => string;
+}): Promise<string | null> {
+  const seen = new Set<string>();
+  let foundId: string | null = null;
+  let url: string | null = input.initialUrl;
+  for (let page = 0; url && page < PROVIDER_WEBHOOK_PAGE_LIMIT; page += 1) {
+    if (seen.has(url)) {
+      throw new CompanionTriggerRegistrationError(
+        "provider_rejected",
+        `${input.provider} webhook reconciliation repeated pagination`,
+      );
+    }
+    seen.add(url);
+    const response = await input.fetch(url, { headers: input.headers });
+    const hooks = z.array(input.schema).safeParse(await response.json().catch(() => null));
+    if (!response.ok || !hooks.success) {
+      throw new CompanionTriggerRegistrationError(
+        "provider_rejected",
+        `${input.provider} webhook reconciliation failed (${response.status})`,
+      );
+    }
+    const nextUrl = providerNextPageUrl({
+      response,
+      currentUrl: url,
+      provider: input.provider,
+      seenUrls: seen,
+    });
+    const matches = hooks.data.filter(input.matches);
+    if (matches.length > 1 || (foundId && matches.length > 0)) {
+      return malformedProviderPagination(input.provider, "duplicate target registrations");
+    }
+    if (matches[0]) foundId = input.idOf(matches[0]);
+    url = nextUrl;
+  }
+  if (url) {
+    throw new CompanionTriggerRegistrationError(
+      "provider_rejected",
+      `${input.provider} webhook reconciliation exceeded its pagination bound`,
+    );
+  }
+  return foundId;
+}
+
+async function findTriggerWebhook(input: {
+  orgId: string;
+  masterKey: Buffer;
+  database: Db;
+  fetch?: typeof globalThis.fetch;
+}, trigger: RegistrationTrigger): Promise<string | null> {
+  const doFetch = input.fetch ?? globalThis.fetch;
+  if (trigger.provider === "linear") {
+    const key = await linearTriggerKeyToken({
+      ...input,
+      providerAccountId: trigger.remote_hook_account_id ?? trigger.provider_account_id,
+    });
+    const lookup: Parameters<typeof findLinearWebhook>[0] = {
+      fetch: doFetch,
+      token: key.token,
+      webhookUrl: trigger.webhook_url,
+    };
+    if (trigger.remote_hook_id) lookup.remoteHookId = trigger.remote_hook_id;
+    return findLinearWebhook(lookup);
+  }
+  if (trigger.provider === "sentry") {
+    if (!trigger.target?.organization || !trigger.target.project) {
+      throw new CompanionTriggerRegistrationError(
+        "provider_rejected",
+        "Sentry webhook reconciliation lacks its exact provider locator",
+      );
+    }
+    const account = await loadTriggerProviderAccount({
+      orgId: input.orgId,
+      provider: "sentry",
+      providerAccountId: trigger.remote_hook_account_id ?? trigger.provider_account_id,
+      database: input.database,
+    });
+    const projectPath = [trigger.target.organization, trigger.target.project]
+      .map(encodeURIComponent)
+      .join("/");
+    return findWebhookFromProviderList({
+      fetch: doFetch,
+      initialUrl: `${SENTRY_API}/projects/${projectPath}/hooks/`,
+      headers: { authorization: `Bearer ${providerTokenOf(account, input.orgId, input.masterKey)}` },
+      provider: "Sentry",
+      schema: z.object({ id: z.string().min(1).max(200), url: z.string() }).passthrough(),
+      matches: (hook) => trigger.remote_hook_id
+        ? hook.id === trigger.remote_hook_id
+        : hook.url === trigger.webhook_url,
+      idOf: (hook) => hook.id,
+    });
+  }
+  if (trigger.provider === "github") {
+    if (!trigger.target?.repo) {
+      throw new CompanionTriggerRegistrationError(
+        "provider_rejected",
+        "GitHub webhook reconciliation lacks its exact provider locator",
+      );
+    }
+    const account = await loadTriggerProviderAccount({
+      orgId: input.orgId,
+      provider: "github",
+      providerAccountId: trigger.remote_hook_account_id ?? trigger.provider_account_id,
+      database: input.database,
+    });
+    const repoPath = trigger.target.repo.split("/").map(encodeURIComponent).join("/");
+    return findWebhookFromProviderList({
+      fetch: doFetch,
+      initialUrl: `${GITHUB_API}/repos/${repoPath}/hooks?per_page=100&page=1`,
+      headers: githubHeaders(providerTokenOf(account, input.orgId, input.masterKey)),
+      provider: "github",
+      schema: z.object({
+        id: z.number().int(),
+        config: z.object({ url: z.string() }).passthrough(),
+      }).passthrough(),
+      matches: (hook) => trigger.remote_hook_id
+        ? String(hook.id) === trigger.remote_hook_id
+        : hook.config.url === trigger.webhook_url,
+      idOf: (hook) => String(hook.id),
+    });
+  }
+  throw new CompanionTriggerRegistrationError(
+    "provider_rejected",
+    "Webhook reconciliation is unavailable for this registered provider",
+  );
+}
+
+export async function inspectCompanionTriggerWebhookV2(input: {
+  orgId: string;
+  companionId: string;
+  triggerId: string;
+  webhookBaseUrl: string;
+  masterKey: Buffer;
+  database: Db;
+  fetch?: typeof globalThis.fetch;
+}): Promise<"present" | "absent"> {
+  const trigger = await loadRegistrationTrigger(input);
+  const found = await findTriggerWebhook(input, trigger);
+  if (found === null) return "absent";
+  return "present";
 }
 
 async function linearTriggerKeyToken(input: {
@@ -839,18 +1148,33 @@ export async function unregisterCompanionTriggerWebhookV2(input: {
   masterKey: Buffer;
   database: Db;
   fetch?: typeof globalThis.fetch;
-}): Promise<void> {
+  /** One-shot purge keeps ownership rows intact until every external resource is gone. */
+  preserveRegistration?: boolean;
+}): Promise<"completed" | "absent"> {
   const trigger = await loadRegistrationTrigger(input);
+  // A failed create can have committed remotely before its id was persisted. Destructive cleanup
+  // re-resolves that narrow case by the exact callback on every attempt, so a crash before DELETE
+  // or an ambiguous DELETE response never turns a local null into provider absence.
+  const remoteHookId = trigger.remote_hook_id ?? (
+    trigger.provider === "linear" || trigger.provider === "sentry" || trigger.provider === "github"
+      ? await findTriggerWebhook(input, trigger)
+      : null
+  );
+  const persist = input.preserveRegistration
+    ? async (): Promise<void> => undefined
+    : async (registration: Parameters<typeof persistRegistration>[0]): Promise<void> => {
+        await persistRegistration(registration);
+      };
   if (trigger.provider === "linear") {
-    if (!trigger.remote_hook_id) {
-      await persistRegistration({
+    if (!remoteHookId) {
+      await persist({
         ...input,
         accountId: null,
         remoteHookId: null,
         status: "unregistered",
         error: null,
       });
-      return;
+      return "absent";
     }
     const key = await linearTriggerKeyToken({
       ...input,
@@ -864,7 +1188,7 @@ export async function unregisterCompanionTriggerWebhookV2(input: {
         headers: { "content-type": "application/json", authorization: key.token.trim() },
         body: JSON.stringify({
           query: LINEAR_DELETE_MUTATION,
-          variables: { id: trigger.remote_hook_id },
+          variables: { id: remoteHookId },
         }),
       });
     } catch {
@@ -872,6 +1196,22 @@ export async function unregisterCompanionTriggerWebhookV2(input: {
         "provider_rejected",
         "linear webhook removal could not reach the provider; the registration is kept",
       );
+    }
+    if (response.status === 404) {
+      if (input.preserveRegistration) {
+        throw new CompanionTriggerRegistrationError(
+          "provider_rejected",
+          "linear webhook removal returned ambiguous absence; reconcile the parent list",
+        );
+      }
+      await persist({
+        ...input,
+        accountId: null,
+        remoteHookId: null,
+        status: "unregistered",
+        error: null,
+      });
+      return "absent";
     }
     if (!response.ok) {
       throw new CompanionTriggerRegistrationError(
@@ -892,25 +1232,31 @@ export async function unregisterCompanionTriggerWebhookV2(input: {
         "linear refused to remove the webhook; the registration is kept",
       );
     }
-    await persistRegistration({
+    await persist({
       ...input,
       accountId: null,
       remoteHookId: null,
       status: "unregistered",
       error: null,
     });
-    return;
+    return "completed";
   }
   if (trigger.provider === "sentry") {
-    if (!trigger.remote_hook_id || !trigger.target?.organization || !trigger.target.project) {
-      await persistRegistration({
+    if (!remoteHookId || !trigger.target?.organization || !trigger.target.project) {
+      if (input.preserveRegistration && remoteHookId) {
+        throw new CompanionTriggerRegistrationError(
+          "provider_rejected",
+          "Sentry webhook deletion lacks its exact provider locator",
+        );
+      }
+      await persist({
         ...input,
         accountId: null,
         remoteHookId: null,
         status: "unregistered",
         error: null,
       });
-      return;
+      return "absent";
     }
     const account = await loadTriggerProviderAccount({
       orgId: input.orgId,
@@ -925,7 +1271,7 @@ export async function unregisterCompanionTriggerWebhookV2(input: {
     let response: Response;
     try {
       response = await (input.fetch ?? globalThis.fetch)(
-        `${SENTRY_API}/projects/${projectPath}/hooks/${encodeURIComponent(trigger.remote_hook_id)}/`,
+        `${SENTRY_API}/projects/${projectPath}/hooks/${encodeURIComponent(remoteHookId)}/`,
         { method: "DELETE", headers: { authorization: `Bearer ${token}` } },
       );
     } catch {
@@ -934,30 +1280,44 @@ export async function unregisterCompanionTriggerWebhookV2(input: {
         "Sentry webhook removal could not reach the provider; the registration is kept",
       );
     }
+    if (response.status === 404 && input.preserveRegistration) {
+      throw new CompanionTriggerRegistrationError(
+        "provider_rejected",
+        "Sentry webhook removal returned ambiguous absence; reconcile the parent list",
+      );
+    }
     if (!response.ok && response.status !== 404) {
       throw new CompanionTriggerRegistrationError(
         "provider_rejected",
         `Sentry refused to remove the webhook (${response.status})`,
       );
     }
-    await persistRegistration({
+    await persist({
       ...input,
       accountId: null,
       remoteHookId: null,
       status: "unregistered",
       error: null,
     });
-    return;
+    return response.status === 404 ? "absent" : "completed";
   }
-  if (trigger.provider !== "github" || !trigger.target?.repo || !trigger.remote_hook_id) {
-    await persistRegistration({
+  if (trigger.provider !== "github" || !trigger.target?.repo || !remoteHookId) {
+    if (input.preserveRegistration && remoteHookId) {
+      throw new CompanionTriggerRegistrationError(
+        "provider_rejected",
+        trigger.provider === "github"
+          ? "GitHub webhook deletion lacks its exact provider locator"
+          : "Webhook deletion is unavailable for this registered provider",
+      );
+    }
+    await persist({
       ...input,
       accountId: null,
       remoteHookId: null,
       status: trigger.provider === "webhook" || trigger.provider === "custom" ? "manual" : "unregistered",
       error: null,
     });
-    return;
+    return "absent";
   }
   const account = await loadTriggerProviderAccount({
     orgId: input.orgId,
@@ -971,7 +1331,7 @@ export async function unregisterCompanionTriggerWebhookV2(input: {
   let response: Response | null;
   try {
     response = await doFetch(
-      `${GITHUB_API}/repos/${repoPath}/hooks/${encodeURIComponent(trigger.remote_hook_id)}`,
+      `${GITHUB_API}/repos/${repoPath}/hooks/${encodeURIComponent(remoteHookId)}`,
       {
         method: "DELETE",
         headers: {
@@ -990,17 +1350,24 @@ export async function unregisterCompanionTriggerWebhookV2(input: {
       "github webhook removal could not reach the provider; the registration is kept",
     );
   }
+  if (response.status === 404 && input.preserveRegistration) {
+    throw new CompanionTriggerRegistrationError(
+      "provider_rejected",
+      "github webhook removal returned ambiguous absence; reconcile the parent list",
+    );
+  }
   if (!response.ok && response.status !== 404) {
     throw new CompanionTriggerRegistrationError(
       "provider_rejected",
       `github refused to remove the webhook (${response.status})`,
     );
   }
-  await persistRegistration({
+  await persist({
     ...input,
     accountId: null,
     remoteHookId: null,
     status: "unregistered",
     error: null,
   });
+  return response.status === 404 ? "absent" : "completed";
 }

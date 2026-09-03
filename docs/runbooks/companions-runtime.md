@@ -213,6 +213,67 @@ rows. Save the final report and its checksum. It must show:
 
 Do not deploy final legacy-removal migrations when any item remains.
 
+## Runtime v2 purge before Runtime v3
+
+THE-511 installs this command and migration but does **not** authorize a production purge. Use this
+section only in a separately approved Runtime v3 cutover change. The historical `companionPurge.js`
+procedure above remains the pre-v2 migration path and must not be substituted.
+
+Prepare a backup, deploy with `COMPANION_COMPANIONS_ENABLED=false`, disable the `runtime-v2`
+PostgreSQL gate through the existing operational procedure, and wait until both v2 and dormant v3
+lease tables have no claim token. Run only from an ephemeral private execution of the runtime image.
+Supply the migration-owner URL, Box inventory credential, object-storage credential, public web base
+URL, and—only for confirmed remote-trigger removal—the secrets master key. Never add the migration
+URL or master key to a long-lived service merely to run inventory.
+
+Save and independently review both mutation-free inventories:
+
+```bash
+node dist/companionV2Purge.js report
+node dist/companionV2Purge.js purge --dry-run
+```
+
+These modes do not write the purge ledger, delete provider resources or objects, or load/decrypt the
+master key. The report must enumerate all Companion-domain row counts, registered remote triggers,
+attachment/output object keys including storage-only orphans, exact runtime named snapshots, image-build
+and duplicate Boxes, database-owned generation Boxes, and exact provider generation names. Stop if
+any inventory source is unavailable or a near-match needs manual ownership investigation.
+
+After separate approval, the only destructive spelling is:
+
+```bash
+node dist/companionV2Purge.js purge --confirm-delete-all-companions
+```
+
+The command rechecks the environment flag, database gate, neutral leases, and advisory lock before
+the first ledger write or external request. It unregisters provider webhooks and removes attachment
+objects, named snapshots, build/duplicate Boxes, and generation Boxes before the final database
+transaction. An authoritative provider absence result is already absent. A GitHub or Sentry
+hook-item `404` is ambiguous because the parent repository or project may instead be inaccessible;
+only a successful complete authenticated parent hook listing can prove that trigger absent, while a
+list `404` remains blocking. Keep the feature disabled, correct any provider/storage problem, and
+rerun. Do not edit ownership or ledger rows manually;
+terminal targets are skipped and recorded Box operations resume. A `requesting` object, snapshot,
+or Box is first reconciled against fresh provider inventory; a `requesting` GitHub, Linear, or
+Sentry trigger is first reconciled through its complete authenticated provider read/list API.
+Absence closes the ledger without another DELETE. Box recovery follows the provider's documented contract:
+[permanent deletion](https://docs.ascii.dev/box/api/reference/boxes/permanently-delete-box-data.md)
+returns `202` and immediately removes the Box from ordinary reads while the retained `bdop_...`
+operation completes; [data retention](https://docs.ascii.dev/box/data-retention.md) is separate from
+that admission boundary. Therefore a recorded operation is polled, fresh authenticated absence
+without one is recorded `absent` without replay, and fresh visibility proves admission did not occur
+and permits a new attempt. `absent` does not claim that physical erasure has finished. Malformed,
+unsupported, unknown, or unavailable reads fail closed. A known-negative DELETE rejection returns
+to retryable state with bounded backoff.
+
+Archive the final report and checksum. It must show zero Companion-domain rows and targets. Verify
+the ledger phase is `database_complete`, every target is `completed` or `absent`, and attempts to
+update/delete the completed evidence fail. The finalizer locks the preserved tables, captures its
+baseline immediately before Companion-row deletion, and requires its before/after fingerprint to
+match. It covers organizations, users, memberships, Skills and secrets, Skill Databases, billing,
+audit, encrypted provider connections, MCP accounts, trigger-provider credentials, and plugin
+trigger keys without treating legitimate activity during provider cleanup as purge damage.
+
 ## Runtime v2 cutover
 
 1. Complete and archive the legacy purge report while the feature flag and database gate are off.
