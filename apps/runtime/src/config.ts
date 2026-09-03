@@ -3,11 +3,11 @@ import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 
 import { COMPANION_BUDGETS, COMPANION_BUDGETS_BASE } from "@companion/contracts";
-import { DESKTOP_REQUEST_MAX_SKEW_SECONDS } from "@companion/companion-runtime";
+import { DESKTOP_REQUEST_MAX_SKEW_SECONDS } from "@companion/companion-runtime/runtime-support";
 import { companionsEnabled, deploymentReleaseId } from "@companion/core";
 
 const DEFAULT_BOX_API_BASE = "https://ascii.dev/api/box/v1";
-const BOX_TTL_SECONDS = COMPANION_BUDGETS_BASE.boxWarmTtlSeconds;
+const BOX_TTL_SECONDS = COMPANION_BUDGETS_BASE.boxProviderTtlSeconds;
 const DEFAULT_CONCURRENCY = 8;
 const DEFAULT_SWEEP_INTERVAL_MS = COMPANION_BUDGETS_BASE.sweepIntervalMs;
 const DEFAULT_LEASE_SECONDS = COMPANION_BUDGETS_BASE.leaseSeconds;
@@ -281,14 +281,6 @@ function directTransportEnv(raw: string | undefined): "off" | "shadow" | "on" {
   const normalized = raw.trim().toLowerCase();
   if (normalized === "off" || normalized === "shadow" || normalized === "on") return normalized;
   throw new RuntimeServiceConfigError("COMPANION_DIRECT_TRANSPORT must be off, shadow, or on");
-}
-
-function booleanEnv(raw: string | undefined, name: string): boolean {
-  if (raw === undefined || raw.trim() === "") return false;
-  const normalized = raw.trim().toLowerCase();
-  if (normalized === "true" || normalized === "1") return true;
-  if (normalized === "false" || normalized === "0") return false;
-  throw new RuntimeServiceConfigError(`${name} must be true or false`);
 }
 
 function privateListenHost(host: string): string {

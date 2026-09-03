@@ -43,12 +43,12 @@ import {
   companionTranscriptEntrySchema,
   companionSharesSchema,
   createCompanionInputSchema,
+  decideCompanionDecisionInputSchema,
   saveCompanionProviderInputSchema,
   saveCompanionPluginInputSchema,
   sendCompanionMessageAcceptedResponseSchema,
   sendCompanionMessageInputSchema,
   setCompanionWorkspaceShareInputSchema,
-  startCompanionRuntimeInputSchema,
   supplementCompanionProviderModels,
   updateCompanionInputSchema,
   updateCompanionMemberStateInputSchema,
@@ -248,9 +248,6 @@ describe("Companion provider contracts", () => {
       name: "Luna",
       system_prompt: "not part of creation",
     })).toThrow();
-    expect(() => startCompanionRuntimeInputSchema.parse({
-      credentials: [{ provider: "anthropic", env_key: "ANTHROPIC_API_KEY", value: "must-not-enter-start" }],
-    })).toThrow();
   });
 
   it("accepts only the temporary Pi-only runtime restart", () => {
@@ -377,7 +374,7 @@ describe("Companion runtime injection contract", () => {
     })).toThrow();
   });
 
-  it("keeps internal MCP material schemas but removes that material from public start", () => {
+  it("keeps internal MCP material schemas outside public lifecycle contracts", () => {
     expect(companionMcpCredentialSchema.parse({
       env_key: "GITHUB_WORK",
       value: "work-secret",
@@ -389,16 +386,6 @@ describe("Companion runtime injection contract", () => {
       command: "github-mcp-server",
       env: { GITHUB_TOKEN: "GITHUB_WORK" },
     })).toMatchObject({ transport: "stdio" });
-    expect(startCompanionRuntimeInputSchema.parse({ client_surface: "mobile_web" }))
-      .toEqual({ client_surface: "mobile_web" });
-    expect(() => startCompanionRuntimeInputSchema.parse({
-      client_surface: "web",
-      mcp_credentials: [{ env_key: "GITHUB_WORK", value: "must-not-enter-start" }],
-    })).toThrow();
-    expect(() => startCompanionRuntimeInputSchema.parse({
-      client_surface: "web",
-      mcp_accounts: [{ id: "github-work" }],
-    })).toThrow();
   });
 });
 
@@ -467,7 +454,6 @@ describe("Companion chat contracts", () => {
       client_message_id: clientMessageId,
       status: "queued",
       queue_sequence: 1,
-      latest_attempt: null,
       replying: false,
       error: null,
       state_changed_at: "2026-08-17T00:00:00.000Z",
@@ -907,6 +893,18 @@ describe("Companion chat contracts", () => {
     }).name).toBe("Standup");
   });
 
+  it("bounds decision answers by Unicode characters instead of UTF-16 code units", () => {
+    const answer = "😀".repeat(8_000);
+    expect(decideCompanionDecisionInputSchema.parse({ action: "answer", answer })).toEqual({
+      action: "answer",
+      answer,
+    });
+    expect(() => decideCompanionDecisionInputSchema.parse({
+      action: "answer",
+      answer: `${answer}a`,
+    })).toThrow();
+  });
+
   it("keeps surfaced routine payloads out of the private run transcript contract", () => {
     const summary = companionRoutineRunSummarySchema.parse({
       run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -1153,7 +1151,7 @@ describe("Companion conversation-list contracts", () => {
       last_observed_at: null,
       last_started_at: null,
       last_stopped_at: null,
-      latest_operation: null,
+      lifecycle_intent: "prepare",
     },
     created_at: "2026-08-14T09:00:00.000Z",
     updated_at: "2026-08-14T09:00:00.000Z",
@@ -1175,7 +1173,7 @@ describe("Companion conversation-list contracts", () => {
     expect(companionSchema.parse(companion).last_message).toBeNull();
   });
 
-  it("accepts layout zero before a Runtime v2 Box has been installed", () => {
+  it("accepts layout zero before a Companion Box has been installed", () => {
     expect(companionSchema.parse({
       ...companion,
       runtime: { ...companion.runtime, disk_layout_version: 0 },
@@ -1194,26 +1192,23 @@ describe("Companion conversation-list contracts", () => {
     })).toThrow();
   });
 
-  it("carries the bounded latest lifecycle operation needed to restore UI after reload", () => {
+  it("accepts only native Runtime v3 lifecycle intents", () => {
     const parsed = companionSchema.parse({
       ...companion,
       runtime: {
         ...companion.runtime,
-        latest_operation: {
-          id: "22222222-2222-4222-8222-222222222222",
-          source_turn_id: null,
-          kind: "restart_box",
-          status: "running",
-          error: null,
-        },
+        lifecycle_intent: "recycle_pi",
       },
     });
 
-    expect(parsed.runtime.latest_operation).toEqual(expect.objectContaining({
-      kind: "restart_box",
-      status: "running",
-    }));
-    expect(parsed.runtime.latest_operation).not.toHaveProperty("checkpoint");
+    expect(parsed.runtime.lifecycle_intent).toBe("recycle_pi");
+    expect(() => companionSchema.parse({
+      ...companion,
+      runtime: {
+        ...companion.runtime,
+        lifecycle_intent: "restart_box",
+      },
+    })).toThrow();
   });
 
   it("carries only what a person or Pi said, in one bounded line", () => {

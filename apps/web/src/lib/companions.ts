@@ -1,7 +1,7 @@
 import type {
   Companion,
   CompanionDesktop,
-  CompanionOperation,
+  CompanionLifecycleAccepted,
   CompanionPluginAccount,
   CompanionPluginOAuthStartInput,
   CompanionPluginOAuthStartResponse,
@@ -31,7 +31,7 @@ import type {
   UpdateCompanionTriggerInput,
 } from "@companion/contracts";
 import {
-  COMPANION_OPERATION_IDEMPOTENCY_HEADER,
+  COMPANION_LIFECYCLE_IDEMPOTENCY_HEADER,
   type RestartCompanionRuntimeInput,
 } from "@companion/contracts/companion-runtime";
 import { ApiFetchError, apiFetch } from "./apiClient";
@@ -46,10 +46,10 @@ function orgHeaders(orgId: string): HeadersInit {
   return { "x-companion-org": orgId };
 }
 
-function operationHeaders(orgId: string, requestId: string): HeadersInit {
+function lifecycleHeaders(orgId: string, requestId: string): HeadersInit {
   return {
     "x-companion-org": orgId,
-    [COMPANION_OPERATION_IDEMPOTENCY_HEADER]: requestId,
+    [COMPANION_LIFECYCLE_IDEMPOTENCY_HEADER]: requestId,
   };
 }
 
@@ -122,15 +122,15 @@ export async function deleteCompanion(
   orgId: string,
   companionId: string,
   requestId: string,
-): Promise<CompanionOperation> {
-  const result = await apiFetch<{ operation: CompanionOperation }>(
+): Promise<CompanionLifecycleAccepted> {
+  const result = await apiFetch<{ lifecycle: CompanionLifecycleAccepted }>(
     `/v1/companions/${encodeURIComponent(companionId)}`,
     {
       method: "DELETE",
-      headers: operationHeaders(orgId, requestId),
+      headers: lifecycleHeaders(orgId, requestId),
     },
   );
-  return result.operation;
+  return result.lifecycle;
 }
 
 export async function updateCompanionMemberState(
@@ -685,22 +685,22 @@ export async function getCompanionRuntime(
   return result.companion;
 }
 
-/** Queue an explicit lifecycle operation; completion is observed through PostgreSQL projections. */
+/** Record an explicit v3 lifecycle desire; completion is observed through PostgreSQL projections. */
 export async function restartCompanionRuntime(
   orgId: string,
   companionId: string,
   input: RestartCompanionRuntimeInput,
   requestId: string,
-): Promise<CompanionOperation> {
-  const result = await apiFetch<{ operation: CompanionOperation }>(
+): Promise<CompanionLifecycleAccepted> {
+  const result = await apiFetch<{ lifecycle: CompanionLifecycleAccepted }>(
     `/v1/companions/${encodeURIComponent(companionId)}/runtime/restart`,
     {
       method: "POST",
-      headers: operationHeaders(orgId, requestId),
+      headers: lifecycleHeaders(orgId, requestId),
       body: JSON.stringify(input),
     },
   );
-  return result.operation;
+  return result.lifecycle;
 }
 
 /**

@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Companion } from "@companion/contracts";
 import {
-  projectCompanionRuntimeV2,
+  projectCompanionRuntime,
   type CompanionRuntimeApiProjection,
 } from "../src/companionRuntimeApi";
 
@@ -43,7 +43,7 @@ const companion: Companion = {
     last_observed_at: null,
     last_started_at: null,
     last_stopped_at: null,
-    latest_operation: null,
+    lifecycle_intent: "prepare",
   },
   created_at: "2026-08-16T00:00:00.000Z",
   updated_at: "2026-08-16T00:00:00.000Z",
@@ -74,58 +74,30 @@ function runtime(
     active_turn: null,
     queued_count: 0,
     interrupted_turn: null,
-    latest_operation: null,
+    lifecycle_intent: "prepare",
     is_replying: false,
     last_observed_at: null,
     ...patch,
   };
 }
 
-function operation(
-  patch: Partial<Record<string, unknown>> = {},
-): Record<string, unknown> {
-  return {
-    id: "22222222-2222-4222-8222-222222222222",
-    companion_id: companion.id,
-    request_id: "33333333-3333-4333-8333-333333333333",
-    source_turn_id: null,
-    kind: "start",
-    trigger: "user",
-    status: "pending",
-    queue_sequence: 1,
-    checkpoint: "pending",
-    attempt_count: 0,
-    error: null,
-    created_at: "2026-08-16T00:01:00+00:00",
-    started_at: null,
-    settled_at: null,
-    ...patch,
-  };
-}
-
-describe("Runtime v2 Companion projection", () => {
-  it("shows accepted lifecycle work as Starting without consulting Box", () => {
-    const projected = projectCompanionRuntimeV2(companion, runtime({
-      latest_operation: operation(),
+describe("Runtime v3 Companion projection", () => {
+  it("projects the durable lifecycle intent without consulting Box", () => {
+    const projected = projectCompanionRuntime(companion, runtime({
+      lifecycle_intent: "recycle_pi",
     }));
 
     expect(projected.runtime).toMatchObject({
-      state: "provisioning",
+      state: "not_created",
       daemon_state: "stopped",
       box_id: null,
       desktop_available: false,
-      latest_operation: {
-        id: "22222222-2222-4222-8222-222222222222",
-        source_turn_id: null,
-        kind: "start",
-        status: "pending",
-        error: null,
-      },
+      lifecycle_intent: "recycle_pi",
     });
   });
 
   it("projects the ACKed replying fact and defaults it to false", () => {
-    const replying = projectCompanionRuntimeV2(companion, runtime({
+    const replying = projectCompanionRuntime(companion, runtime({
       box_id: "bx_23456789",
       box_state: "running",
       pi_state: "running",
@@ -133,12 +105,12 @@ describe("Runtime v2 Companion projection", () => {
     }));
     expect(replying.runtime.replying).toBe(true);
 
-    const idle = projectCompanionRuntimeV2(companion, runtime({ is_replying: false }));
+    const idle = projectCompanionRuntime(companion, runtime({ is_replying: false }));
     expect(idle.runtime.replying).toBe(false);
   });
 
   it("projects a ready Box and idle Pi as online with its applied skill revision", () => {
-    const projected = projectCompanionRuntimeV2(companion, runtime({
+    const projected = projectCompanionRuntime(companion, runtime({
       generation: "9",
       selected_skill_ids: ["44444444-4444-4444-8444-444444444444"],
       selected_mcp_account_ids: ["55555555-5555-4555-8555-555555555555"],
@@ -169,15 +141,15 @@ describe("Runtime v2 Companion projection", () => {
   });
 
   it("preserves the deployable-stage Skill sync error and its Viewer redaction", () => {
-    const owner = projectCompanionRuntimeV2({
+    const owner = projectCompanionRuntime({
       ...companion,
       runtime: { ...companion.runtime, skills_last_error: "Box exec timed out" },
     }, runtime());
-    const viewer = projectCompanionRuntimeV2({
+    const viewer = projectCompanionRuntime({
       ...companion,
       access: "viewer",
-      // The second PostgreSQL read may observe an Editor -> Viewer downgrade after the legacy
-      // projection already returned operator detail, so the Runtime v2 overlay must redact again.
+      // The second PostgreSQL read may observe an Editor -> Viewer downgrade after the first
+      // projection returned operator detail, so the v3 projection must redact again.
       runtime: { ...companion.runtime, skills_last_error: "Box exec timed out" },
     }, runtime({ access_role: "viewer" }));
 
@@ -186,12 +158,12 @@ describe("Runtime v2 Companion projection", () => {
   });
 
   it("rejects a non-positive runtime generation at the projection boundary", () => {
-    expect(() => projectCompanionRuntimeV2(companion, runtime({ generation: 0 })))
+    expect(() => projectCompanionRuntime(companion, runtime({ generation: 0 })))
       .toThrow("Companion runtime generation is invalid");
   });
 
   it("never exposes Box identity or operator error detail to a Viewer", () => {
-    const projected = projectCompanionRuntimeV2(
+    const projected = projectCompanionRuntime(
       { ...companion, access: "viewer" },
       runtime({
         access_role: "viewer",
@@ -209,20 +181,19 @@ describe("Runtime v2 Companion projection", () => {
     expect(projected.runtime.last_error).toBe("Companion runtime needs attention.");
   });
 
-  it("distinguishes an explicitly stopped Box from one never created", () => {
-    const projected = projectCompanionRuntimeV2(companion, runtime({
-      latest_operation: operation({
-        kind: "stop",
-        status: "succeeded",
-        settled_at: "2026-08-16T00:03:00+00:00",
-      }),
+  it("distinguishes an archived Box from one never created", () => {
+    const projected = projectCompanionRuntime(companion, runtime({
+      box_id: "bx_23456789",
+      box_state: "archived",
+      pi_state: "stopped",
+      lifecycle_intent: "archive",
     }));
 
     expect(projected.runtime.state).toBe("stopped");
   });
 
   it("normalizes an archived Box to the stopped client projection", () => {
-    const projected = projectCompanionRuntimeV2(companion, runtime({
+    const projected = projectCompanionRuntime(companion, runtime({
       box_id: "bx_23456789",
       box_state: "archived",
       pi_state: "stopped",
@@ -233,121 +204,51 @@ describe("Runtime v2 Companion projection", () => {
     expect(projected.runtime.replying).toBe(false);
   });
 
-  it("projects the latest lifecycle failure without exposing its detail to Viewers", () => {
-    const failed = operation({
-      kind: "restart_pi",
-      status: "failed",
-      error: {
-        code: "pi_crash_loop",
-        message: "Pi could not stay running.",
-        action: "retry",
-      },
-      settled_at: "2026-08-16T00:03:00+00:00",
-    });
-
-    const owner = projectCompanionRuntimeV2(companion, runtime({ latest_operation: failed }));
-    const viewer = projectCompanionRuntimeV2(
+  it("projects the instance failure without exposing its detail to Viewers", () => {
+    const failure = {
+      box_state: "error" as const,
+      pi_state: "error" as const,
+      last_error_code: "pi_crash_loop",
+      last_error_message: "Pi could not stay running.",
+      last_error_action: "retry",
+    };
+    const owner = projectCompanionRuntime(companion, runtime(failure));
+    const viewer = projectCompanionRuntime(
       { ...companion, access: "viewer" },
-      runtime({ access_role: "viewer", latest_operation: failed }),
+      runtime({ access_role: "viewer", ...failure }),
     );
 
     expect(owner.runtime).toMatchObject({ state: "error", last_error: "Pi could not stay running." });
     expect(viewer.runtime).toMatchObject({
       state: "error",
       last_error: "Companion runtime needs attention.",
-      latest_operation: {
-        kind: "restart_pi",
-        status: "failed",
-        error: {
-          code: "runtime_unavailable",
-          message: "Companion runtime needs attention.",
-          action: "none",
-        },
-      },
     });
   });
 
-  it("keeps a healthy observed runtime online after an older lifecycle failure", () => {
-    const failed = operation({
-      kind: "restart_pi",
-      status: "failed",
-      error: {
-        code: "runtime_execution_failed",
-        message: "Runtime execution failed.",
-        action: "restart_pi",
-      },
-      settled_at: "2026-08-16T00:03:00+00:00",
-    });
-
-    const projected = projectCompanionRuntimeV2(companion, runtime({
+  it("keeps a healthy observed runtime online without synthesizing lifecycle history", () => {
+    const projected = projectCompanionRuntime(companion, runtime({
       box_id: "bx_23456789",
       box_state: "idle",
       pi_state: "idle",
       pi_invocation_id: "pi-healthy",
       last_error_code: null,
       last_error_message: null,
-      latest_operation: failed,
     }));
 
     expect(projected.runtime).toMatchObject({
       state: "running",
       daemon_state: "running",
       last_error: null,
-      latest_operation: {
-        kind: "restart_pi",
-        status: "failed",
-        error: { message: "Runtime execution failed." },
-      },
     });
   });
 
-  it.each([
-    {
-      name: "a Box still provisioning",
-      projection: { box_state: "provisioning", pi_state: "absent" } as const,
-    },
-    {
-      name: "a ready Box whose Pi never started",
-      projection: { box_state: "ready", pi_state: "absent" } as const,
-    },
-  ])("surfaces a failed lifecycle operation over $name", ({ projection }) => {
-    const projected = projectCompanionRuntimeV2(companion, runtime({
-      box_id: "bx_23456789",
-      ...projection,
-      latest_operation: operation({
-        status: "failed",
-        error: {
-          code: "runtime_execution_failed",
-          message: "Runtime execution failed.",
-          action: "restart_pi",
-        },
-        settled_at: "2026-08-16T00:03:00+00:00",
-      }),
-    }));
-
-    expect(projected.runtime).toMatchObject({
-      state: "error",
-      last_error: "Runtime execution failed.",
-      latest_operation: { status: "failed" },
-    });
-  });
-
-  it("prefers the current instance error over an older operation failure", () => {
-    const projected = projectCompanionRuntimeV2(companion, runtime({
+  it("projects the current instance error", () => {
+    const projected = projectCompanionRuntime(companion, runtime({
       box_id: "bx_23456789",
       box_state: "ready",
       pi_state: "error",
       last_error_code: "pi_crash_loop",
       last_error_message: "Pi could not stay running.",
-      latest_operation: operation({
-        status: "failed",
-        error: {
-          code: "provider_unavailable",
-          message: "An older operation failed.",
-          action: "retry",
-        },
-        settled_at: "2026-08-16T00:03:00+00:00",
-      }),
     }));
 
     expect(projected.runtime).toMatchObject({

@@ -6,7 +6,6 @@ import {
 } from "../piEvents";
 import { COMPANION_BUDGETS, COMPANION_RUNTIME_V3_BUDGETS } from "@companion/contracts";
 import type {
-  ErrorAction,
   ProviderRef,
   RuntimeConfigCatalog,
   SafeRuntimeError,
@@ -22,6 +21,47 @@ export type {
   RuntimeV3ProviderMaterial,
   RuntimeV3SkillMaterial,
 } from "../types";
+
+/** One image harvested from Pi's outbox and stored under this Turn's content-addressed key. */
+export interface RuntimeOutputAttachment {
+  storageKey: string;
+  contentType: string;
+  byteSize: number;
+  sha256: string;
+  filename: string;
+  uploadedAt: Date;
+}
+
+/** One user-uploaded file authorized for this durable Turn. */
+export interface RuntimeV3InputAttachment {
+  storageKey: string;
+  contentType: string;
+  byteSize: number;
+  sha256: string;
+  filename: string;
+  position: number;
+  expiresAt: Date;
+}
+
+/** Pi-visible location returned only after the runtime has verified and staged the bytes. */
+export interface RuntimeV3StagedInputAttachment {
+  path: string;
+  contentType: string;
+  byteSize: number;
+}
+
+export class RuntimeV3InputAttachmentError extends Error {
+  constructor(
+    readonly code:
+      | "attachment_expired"
+      | "attachment_staging_failed"
+      | "runtime_authorization_revoked",
+    message: string,
+  ) {
+    super(message);
+    this.name = "RuntimeV3InputAttachmentError";
+  }
+}
 import {
   RuntimeExternalDependencyError,
   RuntimeTerminalPreparationError,
@@ -158,7 +198,13 @@ export type RuntimeV3ProgressionOutcome =
     message: unknown;
   };
 
-export type RuntimeV3ErrorAction = Exclude<ErrorAction, "restart_box">;
+export type RuntimeV3ErrorAction =
+  | "retry"
+  | "cancel"
+  | "restart_pi"
+  | "switch_model"
+  | "reconnect_provider"
+  | "none";
 
 export type RuntimeV3DurableOutcome =
   | { kind: "release" }
@@ -434,12 +480,15 @@ export interface RuntimeV3WarmTurnMaterial {
   content: string;
   cursor: bigint;
   recoveryDeferred?: boolean;
+  outputsHarvested?: boolean;
   /** Routine work runs in its own Pi session while sharing the durable Box workspace. */
   backgroundRoutine?: boolean;
   backgroundKind?: "routine" | "trigger";
   validationOnly?: boolean;
   directWorkspace?: boolean;
   persona?: string | null;
+  messageEventId?: string;
+  inputAttachments?: RuntimeV3InputAttachment[];
 }
 
 export interface RuntimeV3WarmTurnProjection {
@@ -483,6 +532,11 @@ export interface RuntimeV3WarmTurnPersistence {
     projection: RuntimeV3WarmTurnProjection,
     signal?: AbortSignal,
   ): Promise<boolean | "succeeded" | "failed" | "detached" | "cancel_pending">;
+  recordOutputs?(
+    claim: RuntimeV3Claim,
+    input: { attachments: RuntimeOutputAttachment[]; activityAt: Date },
+    signal?: AbortSignal,
+  ): Promise<boolean>;
   recoverExternal?(claim: RuntimeV3Claim, signal?: AbortSignal): Promise<boolean>;
   pendingDelegationCancel?(
     claim: RuntimeV3Claim,
@@ -510,6 +564,11 @@ export interface RuntimeV3WarmTurnPersistence {
 }
 
 export interface RuntimeV3WarmPi {
+  /** Pi's live `get_state.model.input`, read before any attachment bytes reach the Box. */
+  modelInput?(input: {
+    boxId: string;
+    signal?: AbortSignal;
+  }): Promise<Array<"text" | "image">>;
   prompt(input: {
     boxId: string;
     commandId: string;
@@ -565,9 +624,47 @@ export interface RuntimeV3WarmPi {
   }): Promise<{ outcome: "accepted"; invocationId: string } | { outcome: "rejected" | "ambiguous"; code: string }>;
 }
 
+/** Turn-named facade over the broker's legacy `attempt_id` transport field. */
+export interface RuntimeV3TurnOutbox {
+  harvest(input: {
+    orgId: string;
+    companionId: string;
+    boxId: string;
+    turnId: string;
+    deadlineAt: Date;
+    signal: AbortSignal;
+  }): Promise<{ attachments: RuntimeOutputAttachment[]; incomplete: boolean }>;
+  clear(input: { boxId: string; signal: AbortSignal }): Promise<void>;
+}
+
+export interface RuntimeV3InputAttachmentStager {
+  stage(input: {
+    boxId: string;
+    messageEventId: string;
+    attachments: RuntimeV3InputAttachment[];
+    /** Recheck the exact fenced Turn after object reads and immediately before Box writes. */
+    reauthorize(signal: AbortSignal): Promise<boolean>;
+    signal: AbortSignal;
+  }): Promise<RuntimeV3StagedInputAttachment[]>;
+}
+
 export interface RuntimeV3WarmTurnAdvanceOptions {
   persistence: RuntimeV3WarmTurnPersistence;
   pi: RuntimeV3WarmPi;
+  inputAttachments?: RuntimeV3InputAttachmentStager;
+  outbox?: RuntimeV3TurnOutbox;
+  onOutboxDegraded?: () => void;
+}
+
+function inputAttachmentPromptSuffix(
+  staged: readonly RuntimeV3StagedInputAttachment[],
+): string {
+  if (staged.length === 0) return "";
+  const lines = staged.map((attachment, index) =>
+    `${index + 1}. ${attachment.path} (${attachment.contentType}, ${attachment.byteSize} bytes)`);
+  const plural = staged.length === 1 ? "file" : "files";
+  return `\n\n--- The user attached ${staged.length} ${plural}, staged read-only at:\n`
+    + `${lines.join("\n")}\n`;
 }
 
 const LANE_CONVERGENCE_LIMIT = 16;
@@ -844,6 +941,55 @@ export function createRuntimeV3WarmTurnAdvance(
         return { kind: "ack_completed" };
       }
       if (claim.turn.state === "queued") {
+        const inputAttachments = material.inputAttachments ?? [];
+        let stagedAttachments: RuntimeV3StagedInputAttachment[] = [];
+        if (inputAttachments.length > 0) {
+          const stager = options.inputAttachments;
+          const readModelInput = options.pi.modelInput;
+          const messageEventId = material.messageEventId;
+          if (!stager || !readModelInput || !messageEventId) {
+            return {
+              kind: "failed",
+              code: "attachment_staging_unavailable",
+              message: "The files attached to this message could not be prepared.",
+              action: "none",
+            };
+          }
+          const modelInput = await readModelInput({
+            boxId: material.boxId,
+            signal: boundedSignal(signal, COMPANION_RUNTIME_V3_BUDGETS.heartbeatCommandMs),
+          });
+          const requiredInput = inputAttachments.some((attachment) =>
+            attachment.contentType.startsWith("image/")) ? "image" : "text";
+          if (!modelInput.includes("text") || !modelInput.includes(requiredInput)) {
+            return {
+              kind: "failed",
+              code: requiredInput === "image"
+                ? "model_image_input_unsupported"
+                : "model_text_input_unsupported",
+              message: requiredInput === "image"
+                ? "The selected model does not support image input."
+                : "The selected model does not support text input.",
+              action: "switch_model",
+            };
+          }
+          stagedAttachments = await stager.stage({
+            boxId: material.boxId,
+            messageEventId,
+            attachments: inputAttachments,
+            reauthorize: async (reauthorizeSignal) => (await options.persistence.authorize(
+              claim,
+              reauthorizeSignal,
+            )) !== null,
+            signal: boundedSignal(signal, COMPANION_RUNTIME_V3_BUDGETS.heartbeatCommandMs),
+          });
+        }
+        if (options.outbox && !material.backgroundRoutine) {
+          await options.outbox.clear({
+            boxId: material.boxId,
+            signal: boundedSignal(signal, COMPANION_RUNTIME_V3_BUDGETS.heartbeatCommandMs),
+          });
+        }
         const admissionFence = { invocationId: material.piInvocationId, cursor: material.cursor };
         const begun = signal
           ? await options.persistence.beginAdmission(claim, admissionFence, signal)
@@ -865,7 +1011,7 @@ export function createRuntimeV3WarmTurnAdvance(
           commandId: claim.turn.commandId,
           turnId: claim.turn.id,
           expectedInvocationId: material.piInvocationId,
-          message: material.content,
+          message: material.content + inputAttachmentPromptSuffix(stagedAttachments),
           persona: material.persona,
           validationOnly: material.validationOnly,
           directWorkspace: material.directWorkspace,
@@ -1099,6 +1245,40 @@ export function createRuntimeV3WarmTurnAdvance(
             action: "none",
           };
         }
+        if (classified.settled && !material.backgroundRoutine && options.outbox
+          && !material.outputsHarvested) {
+          if (!options.persistence.recordOutputs) {
+            throw new Error("Runtime v3 outbox persistence is unavailable");
+          }
+          const outboxSignal = boundedSignal(
+            signal,
+            COMPANION_RUNTIME_V3_BUDGETS.heartbeatSettlementMs,
+          );
+          const harvested = await options.outbox.harvest({
+              orgId: claim.orgId,
+              companionId: claim.companionId,
+              boxId: material.boxId,
+              turnId: claim.turn.id,
+              deadlineAt: new Date(
+                Date.now() + COMPANION_RUNTIME_V3_BUDGETS.heartbeatSettlementMs,
+              ),
+              signal: outboxSignal,
+            }).catch(() => ({
+              attachments: [],
+              incomplete: true,
+            } satisfies Awaited<ReturnType<RuntimeV3TurnOutbox["harvest"]>>));
+          const recorded = await options.persistence.recordOutputs(claim, {
+            attachments: harvested.attachments,
+            activityAt: new Date(),
+          }, outboxSignal);
+          if (!recorded) return { kind: "release" };
+          if (harvested.incomplete) options.onOutboxDegraded?.();
+          try {
+            await options.outbox.clear({ boxId: material.boxId, signal: outboxSignal });
+          } catch {
+            options.onOutboxDegraded?.();
+          }
+        }
         const projection = {
           throughCursor: classified.throughCursor,
           assistant,
@@ -1197,8 +1377,26 @@ export function createRuntimeV3WarmTurnAdvance(
         if (!page.hasMore) return { kind: "release" };
       }
       return { kind: "release" };
-    } catch {
+    } catch (error) {
       if (signal?.aborted) return { kind: "release" };
+      if (error instanceof RuntimeV3InputAttachmentError) {
+        if (error.code === "runtime_authorization_revoked") {
+          return {
+            kind: "external_retry",
+            failureClass: "authority",
+            source: externalSource(claim),
+            dependencyKey: externalDependencyKey(claim, "authority"),
+            code: error.code,
+            message: "This work is blocked until its external access is available again.",
+          };
+        }
+        return {
+          kind: "failed",
+          code: error.code,
+          message: error.message,
+          action: "none",
+        };
+      }
       if (projectionPendingAck === "terminal") {
         return { kind: "retry_ack" };
       }

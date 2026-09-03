@@ -5,7 +5,6 @@ import { COMPANION_BUDGETS_BASE } from "./companionBudgets";
 import {
   companionActiveTurnSchema,
   companionInterruptedTurnSchema,
-  companionLatestOperationSchema,
   companionQueuedTurnSchema,
   companionRecoveryStatusSchema,
   companionRuntimeSafeErrorSchema,
@@ -656,8 +655,8 @@ export const companionSchema = z.object({
     last_observed_at: z.string().datetime().nullable(),
     last_started_at: z.string().datetime().nullable(),
     last_stopped_at: z.string().datetime().nullable(),
-    /** Latest durable lifecycle intent, sufficient to restore operation UI after navigation/reload. */
-    latest_operation: companionLatestOperationSchema.nullable(),
+    /** Latest durable Runtime v3 lifecycle desire, sufficient to restore UI after navigation. */
+    lifecycle_intent: z.enum(["prepare", "archive", "recycle_pi", "delete"]),
   }),
   created_at: z.string().datetime(),
   updated_at: z.string().datetime(),
@@ -1489,6 +1488,11 @@ export const companionDecisionProposalSchema = z.union([
 ]);
 export type CompanionDecisionProposal = z.infer<typeof companionDecisionProposalSchema>;
 
+const companionDecisionAnswerSchema = z.string().max(16_000).refine(
+  (answer) => Array.from(answer).length <= 8_000,
+  "A decision answer must contain at most 8000 Unicode characters",
+);
+
 /**
  * One permission request Pi blocked on, projected from an `extension_ui_request` in the RPC log.
  * The transcript keeps the decision after refresh and for Viewers; only Owner/Editor may act while
@@ -1505,7 +1509,7 @@ export const companionDecisionSchema = z.object({
   detail: z.string().max(16_000).nullable(),
   status: companionDecisionStatusSchema,
   /** Free-form answer when `kind` is `question` and the card was answered. */
-  answer: z.string().max(8_000).nullable(),
+  answer: companionDecisionAnswerSchema.nullable(),
   decided_by_id: z.string().nullable(),
   decided_by_name: z.string().nullable(),
   decided_at: z.string().datetime().nullable(),
@@ -1565,7 +1569,10 @@ export const decideCompanionDecisionInputSchema = z.discriminatedUnion("action",
   z.object({ action: z.literal("deny") }).strict(),
   z.object({
     action: z.literal("answer"),
-    answer: z.string().trim().min(1).max(8_000),
+    answer: z.string().trim().min(1).max(16_000).refine(
+      (answer) => Array.from(answer).length <= 8_000,
+      "A decision answer must contain at most 8000 Unicode characters",
+    ),
   }).strict(),
 ]);
 export type DecideCompanionDecisionInput = z.infer<typeof decideCompanionDecisionInputSchema>;
@@ -2470,11 +2477,6 @@ export const saveCompanionPluginInputSchema = z.object({
   }
 });
 export type SaveCompanionPluginInput = z.infer<typeof saveCompanionPluginInputSchema>;
-
-export const startCompanionRuntimeInputSchema = z.object({
-  client_surface: companionClientSurfaceSchema.default("web"),
-}).strict();
-export type StartCompanionRuntimeInput = z.infer<typeof startCompanionRuntimeInputSchema>;
 
 export const companionProviderErrorSchema = z.object({
   code: z.enum([

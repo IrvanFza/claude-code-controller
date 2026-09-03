@@ -269,6 +269,116 @@ describe("Runtime v3 progression interface", () => {
     expect(prompt).not.toHaveBeenCalled();
   });
 
+  it("stages authorized input files and clears the outbox before Pi admission", async () => {
+    const stage = vi.fn().mockResolvedValue([{
+      path: "~/attachments/2f883a91-92dd-4fec-b674-b7d250f81f61/0-notes.txt",
+      contentType: "text/plain",
+      byteSize: 5,
+    }]);
+    const clear = vi.fn().mockResolvedValue(undefined);
+    const beginAdmission = vi.fn().mockResolvedValue(true);
+    const prompt = vi.fn().mockResolvedValue({
+      outcome: "rejected" as const,
+      code: "pi_prompt_refused",
+    });
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789",
+          piInvocationId: "invocation-1",
+          content: "Read this",
+          cursor: 0n,
+          messageEventId: `msg:${acceptedTurn.id}`,
+          inputAttachments: [{
+            storageKey: "companion-attachments/object",
+            contentType: "text/plain",
+            byteSize: 5,
+            sha256: "a".repeat(64),
+            filename: "notes.txt",
+            position: 0,
+            expiresAt: new Date("2026-10-01T00:00:00.000Z"),
+          }],
+        }),
+        beginAdmission,
+        recordAdmission: vi.fn(),
+        project: vi.fn(),
+      },
+      pi: {
+        modelInput: vi.fn().mockResolvedValue(["text"]),
+        prompt,
+        read: vi.fn(),
+        acknowledge: vi.fn(),
+      },
+      inputAttachments: { stage },
+      outbox: { harvest: vi.fn(), clear },
+    });
+
+    await expect(advance(mainClaim)).resolves.toMatchObject({
+      kind: "external_retry",
+      failureClass: "box",
+    });
+    expect(stage).toHaveBeenCalledWith(expect.objectContaining({
+      messageEventId: `msg:${acceptedTurn.id}`,
+    }));
+    expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.stringContaining(
+        "~/attachments/2f883a91-92dd-4fec-b674-b7d250f81f61/0-notes.txt (text/plain, 5 bytes)",
+      ),
+    }));
+    expect(stage.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY)
+      .toBeLessThan(clear.mock.invocationCallOrder[0] ?? Number.NEGATIVE_INFINITY);
+    expect(clear.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY)
+      .toBeLessThan(beginAdmission.mock.invocationCallOrder[0] ?? Number.NEGATIVE_INFINITY);
+    expect(beginAdmission.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY)
+      .toBeLessThan(prompt.mock.invocationCallOrder[0] ?? Number.NEGATIVE_INFINITY);
+  });
+
+  it("refuses an image before staging when Pi's live model is text-only", async () => {
+    const stage = vi.fn();
+    const beginAdmission = vi.fn();
+    const prompt = vi.fn();
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789",
+          piInvocationId: "invocation-1",
+          content: "Inspect this image",
+          cursor: 0n,
+          messageEventId: `msg:${acceptedTurn.id}`,
+          inputAttachments: [{
+            storageKey: "companion-attachments/object",
+            contentType: "image/png",
+            byteSize: 5,
+            sha256: "a".repeat(64),
+            filename: "image.png",
+            position: 0,
+            expiresAt: new Date("2026-10-01T00:00:00.000Z"),
+          }],
+        }),
+        beginAdmission,
+        recordAdmission: vi.fn(),
+        project: vi.fn(),
+      },
+      pi: {
+        modelInput: vi.fn().mockResolvedValue(["text"]),
+        prompt,
+        read: vi.fn(),
+        acknowledge: vi.fn(),
+      },
+      inputAttachments: { stage },
+    });
+
+    await expect(advance(mainClaim)).resolves.toEqual({
+      kind: "failed",
+      code: "model_image_input_unsupported",
+      message: "The selected model does not support image input.",
+      action: "switch_model",
+    });
+    expect(stage).not.toHaveBeenCalled();
+    expect(beginAdmission).not.toHaveBeenCalled();
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["pi_prompt_refused", "box", "This work is blocked because its Box is unavailable."],
     ["model_unavailable", "model", "This work is blocked until the selected model is usable again."],
@@ -606,6 +716,173 @@ describe("Runtime v3 progression interface", () => {
       expect(project).toHaveBeenCalledOnce();
     },
   );
+
+  it("harvests an image-only v3 Turn before terminal projection and ACK", async () => {
+    const attachment = {
+      storageKey: "companion-attachments/org/companion/outputs/turn/0-digest",
+      contentType: "image/png",
+      byteSize: 128,
+      sha256: "a".repeat(64),
+      filename: "answer.png",
+      uploadedAt: new Date("2026-09-03T12:00:00.000Z"),
+    };
+    const harvest = vi.fn().mockResolvedValue({ attachments: [attachment], incomplete: false });
+    const clear = vi.fn().mockResolvedValue(undefined);
+    const recordOutputs = vi.fn().mockResolvedValue(true);
+    const project = vi.fn().mockResolvedValue("succeeded");
+    const acknowledge = vi.fn().mockResolvedValue(1n);
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1", content: "image", cursor: 0n,
+        }),
+        beginAdmission: vi.fn(), recordAdmission: vi.fn(), recordOutputs, project,
+      },
+      pi: {
+        prompt: vi.fn(),
+        read: vi.fn().mockResolvedValue({
+          events: [{
+            sequence: 1n, invocationId: "invocation-1", attemptId: acceptedTurn.id,
+            kind: "pi_event", event: { type: "agent_settled" },
+          }],
+          nextCursor: 1n, acknowledgedCursor: 0n, hasMore: false,
+        }),
+        acknowledge,
+      },
+      outbox: { harvest, clear },
+    });
+    const claim = { ...mainClaim, turn: { ...acceptedTurn, state: "running" as const } };
+
+    await expect(advance(claim)).resolves.toEqual({ kind: "ack_completed" });
+    expect(harvest).toHaveBeenCalledWith(expect.objectContaining({ turnId: claim.turn.id }));
+    expect(recordOutputs).toHaveBeenCalledWith(
+      claim,
+      expect.objectContaining({ attachments: [attachment] }),
+      expect.any(AbortSignal),
+    );
+    expect(recordOutputs.mock.invocationCallOrder[0]).toBeLessThan(project.mock.invocationCallOrder[0]!);
+    expect(project.mock.invocationCallOrder[0]).toBeLessThan(acknowledge.mock.invocationCallOrder[0]!);
+    expect(clear).toHaveBeenCalledOnce();
+  });
+
+  it("records an empty degradation before preserving a text terminal result", async () => {
+    const recordOutputs = vi.fn().mockResolvedValue(true);
+    const project = vi.fn().mockResolvedValue("succeeded");
+    const degraded = vi.fn();
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1", content: "text", cursor: 0n,
+        }),
+        beginAdmission: vi.fn(), recordAdmission: vi.fn(), recordOutputs, project,
+      },
+      pi: {
+        prompt: vi.fn(),
+        read: vi.fn().mockResolvedValue({
+          events: [
+            {
+              sequence: 1n, invocationId: "invocation-1", attemptId: acceptedTurn.id,
+              kind: "pi_event", event: {
+                type: "message_end",
+                message: { role: "assistant", content: [{ type: "text", text: "Done" }], stopReason: "stop" },
+              },
+            },
+            {
+              sequence: 2n, invocationId: "invocation-1", attemptId: acceptedTurn.id,
+              kind: "pi_event", event: { type: "agent_settled" },
+            },
+          ],
+          nextCursor: 2n, acknowledgedCursor: 0n, hasMore: false,
+        }),
+        acknowledge: vi.fn().mockResolvedValue(2n),
+      },
+      outbox: {
+        harvest: vi.fn().mockRejectedValue(new Error("outbox unavailable")),
+        clear: vi.fn().mockResolvedValue(undefined),
+      },
+      onOutboxDegraded: degraded,
+    });
+    const claim = { ...mainClaim, turn: { ...acceptedTurn, state: "running" as const } };
+
+    await expect(advance(claim)).resolves.toEqual({ kind: "ack_completed" });
+    expect(recordOutputs).toHaveBeenCalledWith(
+      claim,
+      expect.objectContaining({ attachments: [] }),
+      expect.any(AbortSignal),
+    );
+    expect(degraded).toHaveBeenCalledOnce();
+  });
+
+  it("does not project or ACK when the output fence is stale", async () => {
+    const project = vi.fn();
+    const acknowledge = vi.fn();
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1", content: "image", cursor: 0n,
+        }),
+        beginAdmission: vi.fn(), recordAdmission: vi.fn(),
+        recordOutputs: vi.fn().mockResolvedValue(false), project,
+      },
+      pi: {
+        prompt: vi.fn(),
+        read: vi.fn().mockResolvedValue({
+          events: [{
+            sequence: 1n, invocationId: "invocation-1", attemptId: acceptedTurn.id,
+            kind: "pi_event", event: { type: "agent_settled" },
+          }],
+          nextCursor: 1n, acknowledgedCursor: 0n, hasMore: false,
+        }),
+        acknowledge,
+      },
+      outbox: {
+        harvest: vi.fn().mockResolvedValue({ attachments: [], incomplete: false }),
+        clear: vi.fn(),
+      },
+    });
+
+    await expect(advance({
+      ...mainClaim, turn: { ...acceptedTurn, state: "running" as const },
+    })).resolves.toEqual({ kind: "release" });
+    expect(project).not.toHaveBeenCalled();
+    expect(acknowledge).not.toHaveBeenCalled();
+  });
+
+  it("does not reread the outbox after a committed harvest is taken over", async () => {
+    const harvest = vi.fn();
+    const recordOutputs = vi.fn();
+    const project = vi.fn().mockResolvedValue("succeeded");
+    const acknowledge = vi.fn().mockResolvedValue(1n);
+    const advance = createRuntimeV3WarmTurnAdvance({
+      persistence: {
+        authorize: vi.fn().mockResolvedValue({
+          boxId: "bx_23456789", piInvocationId: "invocation-1", content: "image", cursor: 0n,
+          outputsHarvested: true,
+        }),
+        beginAdmission: vi.fn(), recordAdmission: vi.fn(), recordOutputs, project,
+      },
+      pi: {
+        prompt: vi.fn(),
+        read: vi.fn().mockResolvedValue({
+          events: [{
+            sequence: 1n, invocationId: "invocation-1", attemptId: acceptedTurn.id,
+            kind: "pi_event", event: { type: "agent_settled" },
+          }],
+          nextCursor: 1n, acknowledgedCursor: 0n, hasMore: false,
+        }),
+        acknowledge,
+      },
+      outbox: { harvest, clear: vi.fn() },
+    });
+
+    await expect(advance({
+      ...mainClaim, turn: { ...acceptedTurn, state: "running" as const },
+    })).resolves.toEqual({ kind: "ack_completed" });
+    expect(harvest).not.toHaveBeenCalled();
+    expect(recordOutputs).not.toHaveBeenCalled();
+    expect(project).toHaveBeenCalledOnce();
+    expect(acknowledge).toHaveBeenCalledOnce();
+  });
 
   it("preserves needs-input across unknown pages until correlated activity resumes it", async () => {
     const project = vi.fn().mockResolvedValue(true);

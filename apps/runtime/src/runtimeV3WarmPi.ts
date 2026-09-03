@@ -1,4 +1,4 @@
-import { validatePiJournalRead, type RuntimePiControl } from "@companion/companion-runtime";
+import { validatePiJournalRead, type RuntimeV3PiTransport } from "@companion/companion-runtime/runtime-support";
 import type { RuntimeV3WarmPi } from "@companion/companion-runtime/v3/internal";
 
 const WARM_PI_CALL_TIMEOUT_MS = 30_000;
@@ -9,8 +9,15 @@ function warmCallSignal(signal?: AbortSignal): AbortSignal {
 }
 
 /** Narrow Runtime v3 Pi boundary over the existing, simulator-backed broker transport. */
-export function createRuntimeV3WarmPi(pi: RuntimePiControl): RuntimeV3WarmPi {
+export function createRuntimeV3WarmPi(pi: RuntimeV3PiTransport): RuntimeV3WarmPi {
   return {
+    async modelInput(input) {
+      const state = await pi.brokerState({
+        boxId: input.boxId,
+        signal: warmCallSignal(input.signal),
+      });
+      return state.modelInput;
+    },
     async prompt(input) {
       return await pi.prompt({
         boxId: input.boxId,

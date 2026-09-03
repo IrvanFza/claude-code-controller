@@ -3,7 +3,7 @@ import {
   observedBoxStateFromProvider,
   BoxRuntimeAdapterError,
   type BoxRuntimeLifecycleClient,
-  type CompanionBoxRuntimeV2,
+  type CompanionBoxRuntime,
   type BoxState,
 } from "@companion/box-runtime";
 import { createHash } from "node:crypto";
@@ -12,9 +12,9 @@ import type {
   BrokerWriteOutcome,
   BrokerPromptWriteOutcome,
   RuntimeBoxControl,
-  RuntimePiControl,
+  RuntimeV3PiTransport,
   RuntimeProcessLog,
-} from "@companion/companion-runtime";
+} from "@companion/companion-runtime/runtime-support";
 
 export type RuntimeImageAvailability =
   | "ready"
@@ -37,7 +37,7 @@ export interface RuntimeImageSource {
 export interface RuntimeBoxAdapterOptions {
   lifecycle: BoxRuntimeLifecycleClient;
   /** Fresh adapter per port call prevents one staging call's signal budget leaking into another. */
-  runtime(): CompanionBoxRuntimeV2;
+  runtime(): CompanionBoxRuntime;
   /** Named snapshot source to clone when the baker has a ready layout image. */
   runtimeImage?: RuntimeImageSource;
   /** Structured create evidence: fromImage, fallback reason, and timings. Never secrets. */
@@ -92,9 +92,16 @@ export function createRuntimeBoxControl(options: RuntimeBoxAdapterOptions): Runt
         }
         imageLookupMs = now() - lookupStartedAt;
       }
+      const coldIdempotencyKey = input.idempotencyKey
+        ? coldCreateIdempotencyKey({
+          baseKey: input.idempotencyKey,
+          companionId: input.companionId,
+          generation: input.generation,
+        })
+        : undefined;
       const create = (
         fromImage?: string,
-        idempotencyKey = input.idempotencyKey,
+        idempotencyKey = fromImage ? input.idempotencyKey : coldIdempotencyKey,
         deadlineLimit = input.workDeadlineAt ?? input.deadlineAt,
       ) =>
         options.lifecycle.createGenerationBoxAfterObservedAbsence({
@@ -113,9 +120,9 @@ export function createRuntimeBoxControl(options: RuntimeBoxAdapterOptions): Runt
         if (!from || !isUnknownSnapshot(error)) throw error;
         fallbackReason = "unknown_snapshot_fallback";
         from = undefined;
-        created = await create(undefined, input.idempotencyKey
-          ? coldFallbackIdempotencyKey(input.idempotencyKey)
-          : undefined);
+        // Keep the cold body on its own generation-stable identity. A later claim that no longer
+        // sees the snapshot must replay this exact key, never the snapshot key or the claim fence.
+        created = await create(undefined, coldIdempotencyKey);
       }
       const result = created;
       // A snapshot source that still ended without a clone name means this create cold-installed.
@@ -188,7 +195,7 @@ export function createRuntimeBoxControl(options: RuntimeBoxAdapterOptions): Runt
   };
 }
 
-export function createRuntimePiControl(options: RuntimeBoxAdapterOptions): RuntimePiControl {
+export function createRuntimePiControl(options: RuntimeBoxAdapterOptions): RuntimeV3PiTransport {
   return {
     async stopPiDaemon(input) {
       await options.runtime().stopPiDaemon(input);
@@ -327,7 +334,7 @@ export function createRuntimePiControl(options: RuntimeBoxAdapterOptions): Runti
 }
 
 function writeOutcome(
-  result: Awaited<ReturnType<CompanionBoxRuntimeV2["dispatchAbort"]>>,
+  result: Awaited<ReturnType<CompanionBoxRuntime["dispatchAbort"]>>,
 ): BrokerWriteOutcome {
   if (result.outcome === "refused") return { outcome: "rejected", code: result.code };
   if (result.outcome === "ambiguous") return { outcome: "ambiguous", code: result.code };
@@ -338,7 +345,7 @@ function writeOutcome(
 }
 
 function promptWriteOutcome(
-  result: Awaited<ReturnType<CompanionBoxRuntimeV2["dispatchPrompt"]>>,
+  result: Awaited<ReturnType<CompanionBoxRuntime["dispatchPrompt"]>>,
 ): BrokerPromptWriteOutcome {
   if (result.outcome === "refused") {
     return {
@@ -358,9 +365,9 @@ function promptWriteOutcome(
 }
 
 function brokerState(
-  state: Awaited<ReturnType<CompanionBoxRuntimeV2["brokerState"]>>,
+  state: Awaited<ReturnType<CompanionBoxRuntime["brokerState"]>>,
   expectedLayoutMarker: string,
-): Awaited<ReturnType<RuntimePiControl["brokerState"]>> {
+): Awaited<ReturnType<RuntimeV3PiTransport["brokerState"]>> {
   return {
     ...state,
     layoutCurrent: state.layoutMarker === expectedLayoutMarker,
@@ -411,10 +418,14 @@ function isUnknownSnapshot(error: unknown): boolean {
   return error.providerCode === "unknown_snapshot" || error.stableCode === "box_not_found";
 }
 
-/** A known-negative snapshot response may retry cold with a distinct replay-stable provider key. */
-function coldFallbackIdempotencyKey(source: string): string {
+/** Stable external identity for the cold fingerprint, independent of every preparation claim. */
+function coldCreateIdempotencyKey(input: {
+  baseKey: string;
+  companionId: string;
+  generation: bigint;
+}): string {
   const bytes = createHash("sha256")
-    .update(`companion:cold-fallback:${source}`)
+    .update(`companion:cold-create:${input.companionId}:${input.generation}:${input.baseKey}`)
     .digest()
     .subarray(0, 16);
   bytes[6] = (bytes[6]! & 0x0f) | 0x50;

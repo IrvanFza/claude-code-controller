@@ -50,60 +50,59 @@ import {
   companionsEnabled,
   companionCatalogModel,
   getCompanionProviderCatalog,
-  answerCompanionConfigDecisionV2,
-  answerCompanionDecisionV2,
-  answerCompanionRoutineDecisionV2,
-  answerCompanionTriggerDecisionV2,
-  cancelCompanionTurnV2,
+  answerCompanionConfigDecision,
+  answerCompanionDecision,
+  answerCompanionRoutineDecision,
+  answerCompanionTriggerDecision,
+  cancelCompanionTurn,
   buildCompanionRosterSync,
   buildCompanionThreadDelta,
   buildCompanionThreadSequenceCursor,
   validateCompanionSyncCursor,
   classifyCompanionTriggerFireError,
   composeTriggerPrompt,
-  createCompanionV2,
-  createCompanionRoutineV2,
-  createCompanionTriggerV2,
+  createCompanionWithRuntime,
+  createCompanionRoutine,
+  createCompanionTrigger,
   createCompanionTranscriptionSession,
   transcribeCompanionAudio,
-  deleteCompanionRoutineV2,
-  deleteCompanionTriggerV2,
-  duplicateCompanionV2,
-  enqueueCompanionOperationV2,
+  deleteCompanionRoutine,
+  deleteCompanionTrigger,
+  duplicateCompanionWithRuntime,
+  desireCompanionLifecycleV3,
   enqueueCompanionTurn,
   extractTriggerDeliveryId,
   failCompanionTriggerFire,
   fireCompanionTrigger,
-  getCompanionDecisionV2,
-  getCompanionRoutineRunV2,
-  getCompanionTriggerRunV2,
+  getCompanionDecision,
+  getCompanionRoutineRun,
+  getCompanionTriggerRun,
   getCompanionTriggerForWebhook,
   getCompanion,
-  getCompanionV2,
-  listCompanionsV2,
-  listCompanionRoutinesV2,
-  listCompanionRoutineRunsV2,
-  listCompanionTriggerRunsV2,
-  listCompanionTriggersV2,
-  readCompanionAttachmentV2,
-  readCompanionThreadChangesV2,
-  readCompanionThreadProjectionSequenceV2,
+  getCompanionRuntimeView,
+  listCompanionRuntimeViews,
+  listCompanionRoutines,
+  listCompanionRoutineRuns,
+  listCompanionTriggerRuns,
+  listCompanionTriggers,
+  readCompanionAttachment,
+  readCompanionThreadChanges,
+  readCompanionThreadProjectionSequence,
   readCompanionThreadSequenceCursor,
   readCompanionThreadWindowCursor,
-  readCompanionThreadWindowV2,
-  readCompanionThreadV2,
-  syncCompanionThreadV2,
-  retryCompanionTurnV2,
-  rotateCompanionTriggerSecretV2,
-  registerCompanionTriggerWebhookV2,
-  unregisterCompanionTriggerWebhookV2,
-  setCompanionWorkspaceShareV2,
-  setCompanionProviderV2,
+  readCompanionThreadWindow,
+  readCompanionThread,
+  syncCompanionThread,
+  rotateCompanionTriggerSecret,
+  registerCompanionTriggerWebhook,
+  unregisterCompanionTriggerWebhook,
+  setCompanionWorkspaceShare,
+  setCompanionProvider,
   triggerFireMessageId,
-  updateCompanionMemberStateV2,
-  updateCompanionRoutineV2,
-  updateCompanionTriggerV2,
-  updateCompanionV2,
+  updateCompanionMemberState,
+  updateCompanionRoutine,
+  updateCompanionTrigger,
+  updateCompanionWithRuntime,
   deleteCompanionPlugin,
   deleteCompanionProvider,
   listCompanionShares,
@@ -194,13 +193,11 @@ import {
   companionThreadDeltaResponseSchema,
   companionThreadWindowQuerySchema,
   companionThreadWindowSchema,
-  startCompanionRuntimeInputSchema,
   saveCompanionPluginInputSchema,
   updateCompanionInputSchema,
   updateCompanionMemberStateInputSchema,
   updateCompanionRoutineInputSchema,
   updateCompanionTriggerInputSchema,
-  retryCompanionTurnInputSchema,
   createCompanionSectionInputSchema,
   updateCompanionSectionInputSchema,
   reorderCompanionSectionsInputSchema,
@@ -211,8 +208,8 @@ import {
   notificationInstallationIdSchema,
 } from "@companion/contracts/notifications";
 import {
-  COMPANION_OPERATION_IDEMPOTENCY_HEADER,
-  companionOperationRequestIdSchema,
+  COMPANION_LIFECYCLE_IDEMPOTENCY_HEADER,
+  companionLifecycleRequestIdSchema,
   restartCompanionRuntimeInputSchema,
 } from "@companion/contracts/companion-runtime";
 import { db, withTenantContext, type Db } from "@companion/db";
@@ -236,7 +233,7 @@ const COMPANION_PLUGIN_OAUTH_TTL_MS = 10 * 60_000;
 const COMPANION_PROVIDER_OAUTH_FLOW_PURPOSE = "companion-provider-oauth-flow";
 const COMPANION_PROVIDER_OAUTH_COOKIE = "companion_provider_oauth";
 
-type CompanionUpdatePatch = Parameters<typeof updateCompanionV2>[0]["patch"];
+type CompanionUpdatePatch = Parameters<typeof updateCompanionWithRuntime>[0]["patch"];
 type CompanionMessageFormInput = {
   content: string;
   client_message_id: string | undefined;
@@ -263,54 +260,53 @@ function defaultCompanionRouteDependencies() {
     getSkillArchive,
     deleteStorageObject,
     mintCompanionDesktop,
-    answerCompanionConfigDecisionV2,
-    answerCompanionDecisionV2,
-    readCompanionAttachmentV2,
-    cancelCompanionTurnV2,
-    createCompanionV2,
-    duplicateCompanionV2,
-    enqueueCompanionOperationV2,
+    answerCompanionConfigDecision,
+    answerCompanionDecision,
+    readCompanionAttachment,
+    cancelCompanionTurn,
+    createCompanionWithRuntime,
+    duplicateCompanionWithRuntime,
+    desireCompanionLifecycleV3,
     enqueueCompanionTurn,
-    getCompanionDecisionV2,
+    getCompanionDecision,
     getCompanion,
-    getCompanionV2,
-    listCompanionsV2,
-    listCompanionRoutinesV2,
-    listCompanionRoutineRunsV2,
-    getCompanionRoutineRunV2,
-    createCompanionRoutineV2,
-    updateCompanionRoutineV2,
-    deleteCompanionRoutineV2,
+    getCompanionRuntimeView,
+    listCompanionRuntimeViews,
+    listCompanionRoutines,
+    listCompanionRoutineRuns,
+    getCompanionRoutineRun,
+    createCompanionRoutine,
+    updateCompanionRoutine,
+    deleteCompanionRoutine,
     createCompanionTranscriptionSession,
     transcribeCompanionAudio,
-    answerCompanionRoutineDecisionV2,
-    listCompanionTriggersV2,
+    answerCompanionRoutineDecision,
+    listCompanionTriggers,
     listCompanionTriggerProviderAccounts,
-    listCompanionTriggerRunsV2,
-    getCompanionTriggerRunV2,
-    createCompanionTriggerV2,
-    updateCompanionTriggerV2,
-    deleteCompanionTriggerV2,
-    rotateCompanionTriggerSecretV2,
-    answerCompanionTriggerDecisionV2,
-    registerCompanionTriggerWebhookV2,
-    unregisterCompanionTriggerWebhookV2,
+    listCompanionTriggerRuns,
+    getCompanionTriggerRun,
+    createCompanionTrigger,
+    updateCompanionTrigger,
+    deleteCompanionTrigger,
+    rotateCompanionTriggerSecret,
+    answerCompanionTriggerDecision,
+    registerCompanionTriggerWebhook,
+    unregisterCompanionTriggerWebhook,
     disconnectCompanionTriggerProviderAccount,
     ensureOAuthCompanionTriggerProviderAccount,
     saveCompanionTriggerProviderAccount,
     getCompanionTriggerForWebhook,
     fireCompanionTrigger,
     failCompanionTriggerFire,
-    readCompanionThreadV2,
-    readCompanionThreadChangesV2,
-    readCompanionThreadProjectionSequenceV2,
-    readCompanionThreadWindowV2,
-    syncCompanionThreadV2,
-    retryCompanionTurnV2,
-    setCompanionProviderV2,
-    setCompanionWorkspaceShareV2,
-    updateCompanionMemberStateV2,
-    updateCompanionV2,
+    readCompanionThread,
+    readCompanionThreadChanges,
+    readCompanionThreadProjectionSequence,
+    readCompanionThreadWindow,
+    syncCompanionThread,
+    setCompanionProvider,
+    setCompanionWorkspaceShare,
+    updateCompanionMemberState,
+    updateCompanionWithRuntime,
     resolveCompanionMcpBrokerAuthorization,
     resolveCompanionControlAuthorization,
     getCompanionControlRequest,
@@ -344,7 +340,7 @@ const VIEWER_RUNTIME_ERROR: CompanionRuntimeSafeError = {
 /**
  * A Viewer can follow durable progress, but runtime diagnostics and their recovery hints belong to
  * the Owner/Editor operating boundary. Keep the same turn shape so polling remains stable while
- * replacing both the turn-level and attempt-level error with one non-actionable projection.
+ * replacing its error with one non-actionable projection.
  */
 function projectTurnForHttp(
   turn: CompanionTurn | null,
@@ -354,14 +350,6 @@ function projectTurnForHttp(
   return {
     ...turn,
     error: turn.error === null ? null : { ...VIEWER_RUNTIME_ERROR },
-    latest_attempt: turn.latest_attempt === null
-      ? null
-      : {
-          ...turn.latest_attempt,
-          error: turn.latest_attempt.error === null
-            ? null
-            : { ...VIEWER_RUNTIME_ERROR },
-        },
   };
 }
 
@@ -801,51 +789,50 @@ export function registerCompanionRoutes(
     getSkillArchive,
     deleteStorageObject,
     mintCompanionDesktop,
-    answerCompanionConfigDecisionV2,
-    answerCompanionDecisionV2,
-    readCompanionAttachmentV2,
-    cancelCompanionTurnV2,
-    createCompanionV2,
-    duplicateCompanionV2,
-    enqueueCompanionOperationV2,
+    answerCompanionConfigDecision,
+    answerCompanionDecision,
+    readCompanionAttachment,
+    cancelCompanionTurn,
+    createCompanionWithRuntime,
+    duplicateCompanionWithRuntime,
+    desireCompanionLifecycleV3,
     enqueueCompanionTurn,
-    getCompanionDecisionV2,
+    getCompanionDecision,
     getCompanion,
-    getCompanionV2,
-    listCompanionsV2,
-    listCompanionRoutinesV2,
-    listCompanionRoutineRunsV2,
-    getCompanionRoutineRunV2,
-    createCompanionRoutineV2,
-    updateCompanionRoutineV2,
-    deleteCompanionRoutineV2,
+    getCompanionRuntimeView,
+    listCompanionRuntimeViews,
+    listCompanionRoutines,
+    listCompanionRoutineRuns,
+    getCompanionRoutineRun,
+    createCompanionRoutine,
+    updateCompanionRoutine,
+    deleteCompanionRoutine,
     createCompanionTranscriptionSession,
     transcribeCompanionAudio,
-    answerCompanionRoutineDecisionV2,
-    listCompanionTriggersV2,
+    answerCompanionRoutineDecision,
+    listCompanionTriggers,
     listCompanionTriggerProviderAccounts,
-    listCompanionTriggerRunsV2,
-    getCompanionTriggerRunV2,
-    createCompanionTriggerV2,
-    updateCompanionTriggerV2,
-    deleteCompanionTriggerV2,
-    rotateCompanionTriggerSecretV2,
-    answerCompanionTriggerDecisionV2,
-    registerCompanionTriggerWebhookV2,
-    unregisterCompanionTriggerWebhookV2,
+    listCompanionTriggerRuns,
+    getCompanionTriggerRun,
+    createCompanionTrigger,
+    updateCompanionTrigger,
+    deleteCompanionTrigger,
+    rotateCompanionTriggerSecret,
+    answerCompanionTriggerDecision,
+    registerCompanionTriggerWebhook,
+    unregisterCompanionTriggerWebhook,
     disconnectCompanionTriggerProviderAccount,
     ensureOAuthCompanionTriggerProviderAccount,
     saveCompanionTriggerProviderAccount,
-    readCompanionThreadChangesV2,
-    readCompanionThreadProjectionSequenceV2,
-    readCompanionThreadWindowV2,
-    readCompanionThreadV2,
-    syncCompanionThreadV2,
-    retryCompanionTurnV2,
-    setCompanionProviderV2,
-    setCompanionWorkspaceShareV2,
-    updateCompanionMemberStateV2,
-    updateCompanionV2,
+    readCompanionThreadChanges,
+    readCompanionThreadProjectionSequence,
+    readCompanionThreadWindow,
+    readCompanionThread,
+    syncCompanionThread,
+    setCompanionProvider,
+    setCompanionWorkspaceShare,
+    updateCompanionMemberState,
+    updateCompanionWithRuntime,
     resolveCompanionMcpBrokerAuthorization,
     resolveCompanionControlAuthorization,
     getCompanionControlRequest,
@@ -874,7 +861,7 @@ export function registerCompanionRoutes(
     database: Db;
     fallback: CompanionTrigger;
   }): Promise<CompanionTrigger> {
-    const triggers = await listCompanionTriggersV2({
+    const triggers = await listCompanionTriggers({
       orgId: input.orgId,
       companionId: input.companionId,
       database: input.database,
@@ -893,9 +880,9 @@ export function registerCompanionRoutes(
     if (!supportsAutomaticTriggerRegistration(trigger)) return trigger;
     if (trigger.registration_status === "registered" && trigger.remote_hook_id) return trigger;
 
-    let registration: Awaited<ReturnType<typeof registerCompanionTriggerWebhookV2>>;
+    let registration: Awaited<ReturnType<typeof registerCompanionTriggerWebhook>>;
     try {
-      registration = await registerCompanionTriggerWebhookV2({
+      registration = await registerCompanionTriggerWebhook({
         orgId: input.orgId,
         companionId: input.companionId,
         triggerId: trigger.id,
@@ -938,7 +925,7 @@ export function registerCompanionRoutes(
     const trigger = input.trigger;
     if (!supportsAutomaticTriggerRegistration(trigger)) return;
     if (trigger.registration_status !== "registered" && !trigger.remote_hook_id) return;
-    await unregisterCompanionTriggerWebhookV2({
+    await unregisterCompanionTriggerWebhook({
       orgId: input.orgId,
       companionId: input.companionId,
       triggerId: trigger.id,
@@ -959,7 +946,7 @@ export function registerCompanionRoutes(
     if (request.kind === "model_change") {
       const body = z.object({ model_id: z.string().trim().min(1).max(200) }).strict()
         .parse(request.payload);
-      const companion = await updateCompanionV2({
+      const companion = await updateCompanionWithRuntime({
         actor: input.actor,
         orgId: input.orgId,
         companionId: input.companionId,
@@ -998,7 +985,7 @@ export function registerCompanionRoutes(
       const body = companionRequestRoutineChangeInputSchema.parse(request.payload);
       if (body.action === "create") {
         const draft = companionRoutineDraftSchema.parse(body.draft);
-        const routine = await createCompanionRoutineV2({
+        const routine = await createCompanionRoutine({
           orgId: input.orgId,
           companionId: input.companionId,
           id: request.id,
@@ -1009,7 +996,7 @@ export function registerCompanionRoutes(
       }
       if (!body.routine_id) throw new Error("routine id is required");
       if (body.action === "delete") {
-        await deleteCompanionRoutineV2({
+        await deleteCompanionRoutine({
           orgId: input.orgId,
           companionId: input.companionId,
           routineId: body.routine_id,
@@ -1017,7 +1004,7 @@ export function registerCompanionRoutes(
         });
         return { routine_id: body.routine_id, deleted: true };
       }
-      const routine = await updateCompanionRoutineV2({
+      const routine = await updateCompanionRoutine({
         orgId: input.orgId,
         companionId: input.companionId,
         routineId: body.routine_id,
@@ -1031,7 +1018,7 @@ export function registerCompanionRoutes(
     const body = companionRequestTriggerChangeInputSchema.parse(request.payload);
     if (body.action === "create") {
       const draft = companionTriggerDraftSchema.parse(body.draft);
-      const created = await createCompanionTriggerV2({
+      const created = await createCompanionTrigger({
         orgId: input.orgId,
         companionId: input.companionId,
         id: request.id,
@@ -1053,7 +1040,7 @@ export function registerCompanionRoutes(
       })) };
     }
     if (!body.trigger_id) throw new Error("trigger id is required");
-    const current = (await listCompanionTriggersV2({
+    const current = (await listCompanionTriggers({
       orgId: input.orgId,
       companionId: input.companionId,
       database: input.database,
@@ -1066,7 +1053,7 @@ export function registerCompanionRoutes(
         trigger: current,
         database: input.database,
       });
-      await deleteCompanionTriggerV2({
+      await deleteCompanionTrigger({
         orgId: input.orgId,
         companionId: input.companionId,
         triggerId: body.trigger_id,
@@ -1075,7 +1062,7 @@ export function registerCompanionRoutes(
       return { trigger_id: body.trigger_id, deleted: true };
     }
     if (body.action === "rotate_secret") {
-      const trigger = await rotateCompanionTriggerSecretV2({
+      const trigger = await rotateCompanionTriggerSecret({
         orgId: input.orgId,
         companionId: input.companionId,
         triggerId: body.trigger_id,
@@ -1095,7 +1082,7 @@ export function registerCompanionRoutes(
       trigger: current,
       database: input.database,
     });
-    const updated = await updateCompanionTriggerV2({
+    const updated = await updateCompanionTrigger({
       orgId: input.orgId,
       companionId: input.companionId,
       triggerId: body.trigger_id,
@@ -1307,7 +1294,7 @@ export function registerCompanionRoutes(
       // keeps chat text off a surface that displays none of it.
       const withLastMessage = c.req.query("preview") !== "false";
       const companions = await tenant(c, ({ actor, orgId, database }) =>
-        listCompanionsV2({ actor, orgId, withLastMessage, database }));
+        listCompanionRuntimeViews({ actor, orgId, withLastMessage, database }));
       // The list carries each thread's last line now, so it is chat text and must not sit in a disk
       // cache after the session that read it, the way every other sensitive read here is treated.
       c.header("Cache-Control", "private, no-store");
@@ -1330,7 +1317,7 @@ export function registerCompanionRoutes(
           });
         }
         const [companions, sections] = await Promise.all([
-          listCompanionsV2({ actor, orgId, withLastMessage: true, database }),
+          listCompanionRuntimeViews({ actor, orgId, withLastMessage: true, database }),
           listCompanionSections({ actor, orgId, database }),
         ]);
         return buildCompanionRosterSync({
@@ -1353,7 +1340,7 @@ export function registerCompanionRoutes(
     try {
       const body = createCompanionInputSchema.parse(await c.req.json());
       const companion = await tenant(c, ({ actor, orgId, database }) =>
-        createCompanionV2({
+        createCompanionWithRuntime({
           actor,
           orgId,
           name: body.name,
@@ -1710,7 +1697,7 @@ export function registerCompanionRoutes(
       const context = await tenant(c, async ({ actor, orgId, database }) => {
         if (body.companion_id && body.control_request_id) {
           const [companion, request] = await Promise.all([
-            getCompanionV2({ actor, orgId, companionId: body.companion_id, database }),
+            getCompanionRuntimeView({ actor, orgId, companionId: body.companion_id, database }),
             getCompanionControlRequest({
               orgId,
               companionId: body.companion_id,
@@ -1979,7 +1966,7 @@ export function registerCompanionRoutes(
     try {
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const companion = await tenant(c, ({ actor, orgId, database }) =>
-        getCompanionV2({ actor, orgId, companionId, withLastMessage: true, database }));
+        getCompanionRuntimeView({ actor, orgId, companionId, withLastMessage: true, database }));
       c.header("Cache-Control", "private, no-store");
       return c.json({ companion });
     } catch (error) {
@@ -1992,7 +1979,7 @@ export function registerCompanionRoutes(
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const patch = updateCompanionMemberStateInputSchema.parse(await c.req.json());
       const companion = await tenant(c, ({ actor, orgId, database }) =>
-        updateCompanionMemberStateV2({ actor, orgId, companionId, patch, database }));
+        updateCompanionMemberState({ actor, orgId, companionId, patch, database }));
       return c.json({ companion });
     } catch (error) {
       return routeError(c, error);
@@ -2003,7 +1990,7 @@ export function registerCompanionRoutes(
     try {
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const companion = await tenant(c, ({ actor, orgId, database }) =>
-        duplicateCompanionV2({ actor, orgId, companionId, database }));
+        duplicateCompanionWithRuntime({ actor, orgId, companionId, database }));
       return c.json({ companion }, 201);
     } catch (error) {
       return routeError(c, error);
@@ -2025,7 +2012,7 @@ export function registerCompanionRoutes(
       }
       if (body.icon !== undefined) patch.icon = body.icon;
       const companion = await tenant(c, ({ actor, orgId, database }) =>
-        updateCompanionV2({ actor, orgId, companionId, patch, database }));
+        updateCompanionWithRuntime({ actor, orgId, companionId, patch, database }));
       return c.json({ companion });
     } catch (error) {
       return routeError(c, error);
@@ -2036,7 +2023,7 @@ export function registerCompanionRoutes(
     try {
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const routines = await tenant(c, ({ orgId, database }) =>
-        listCompanionRoutinesV2({ orgId, companionId, database }));
+        listCompanionRoutines({ orgId, companionId, database }));
       c.header("Cache-Control", "private, no-store");
       return c.json({ routines });
     } catch (error) {
@@ -2053,7 +2040,7 @@ export function registerCompanionRoutes(
         cursor: c.req.query("cursor"),
       });
       const history = await tenant(c, ({ orgId, database }) =>
-        listCompanionRoutineRunsV2({
+        listCompanionRoutineRuns({
           orgId,
           companionId,
           routineId,
@@ -2077,7 +2064,7 @@ export function registerCompanionRoutes(
         entry_cursor: c.req.query("entry_cursor"),
       });
       const run = await tenant(c, ({ orgId, database }) =>
-        getCompanionRoutineRunV2({
+        getCompanionRoutineRun({
           orgId,
           companionId,
           runId,
@@ -2097,7 +2084,7 @@ export function registerCompanionRoutes(
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const body = createCompanionRoutineInputSchema.parse(await c.req.json());
       const routine = await tenant(c, ({ orgId, database }) =>
-        createCompanionRoutineV2({
+        createCompanionRoutine({
           orgId,
           companionId,
           id: body.id,
@@ -2120,7 +2107,7 @@ export function registerCompanionRoutes(
       const routineId = companionIdSchema.parse(c.req.param("routineId"));
       const body = updateCompanionRoutineInputSchema.parse(await c.req.json());
       const routine = await tenant(c, ({ orgId, database }) =>
-        updateCompanionRoutineV2({
+        updateCompanionRoutine({
           orgId,
           companionId,
           routineId,
@@ -2142,7 +2129,7 @@ export function registerCompanionRoutes(
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const routineId = companionIdSchema.parse(c.req.param("routineId"));
       await tenant(c, ({ orgId, database }) =>
-        deleteCompanionRoutineV2({ orgId, companionId, routineId, database }));
+        deleteCompanionRoutine({ orgId, companionId, routineId, database }));
       return c.body(null, 204);
     } catch (error) {
       return routeError(c, error);
@@ -2153,7 +2140,7 @@ export function registerCompanionRoutes(
     try {
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const triggers = await tenant(c, ({ orgId, database }) =>
-        listCompanionTriggersV2({
+        listCompanionTriggers({
           orgId,
           companionId,
           database,
@@ -2176,7 +2163,7 @@ export function registerCompanionRoutes(
         cursor: c.req.query("cursor"),
       });
       const history = await tenant(c, ({ orgId, database }) =>
-        listCompanionTriggerRunsV2({
+        listCompanionTriggerRuns({
           orgId,
           companionId,
           triggerId,
@@ -2200,7 +2187,7 @@ export function registerCompanionRoutes(
         entry_cursor: c.req.query("entry_cursor"),
       });
       const run = await tenant(c, ({ orgId, database }) =>
-        getCompanionTriggerRunV2({
+        getCompanionTriggerRun({
           orgId,
           companionId,
           runId,
@@ -2220,7 +2207,7 @@ export function registerCompanionRoutes(
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const body = createCompanionTriggerInputSchema.parse(await c.req.json());
       const trigger = await tenant(c, async ({ orgId, database }) => {
-        const created = await createCompanionTriggerV2({
+        const created = await createCompanionTrigger({
           orgId,
           companionId,
           id: body.id,
@@ -2255,7 +2242,7 @@ export function registerCompanionRoutes(
           || body.target !== undefined
           || body.provider_account_id !== undefined;
         if (registrationChanged) {
-          const current = (await listCompanionTriggersV2({
+          const current = (await listCompanionTriggers({
             orgId,
             companionId,
             database,
@@ -2270,7 +2257,7 @@ export function registerCompanionRoutes(
             });
           }
         }
-        const updated = await updateCompanionTriggerV2({
+        const updated = await updateCompanionTrigger({
           orgId,
           companionId,
           triggerId,
@@ -2297,7 +2284,7 @@ export function registerCompanionRoutes(
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const triggerId = companionIdSchema.parse(c.req.param("triggerId"));
       await tenant(c, async ({ orgId, database }) => {
-        const current = (await listCompanionTriggersV2({
+        const current = (await listCompanionTriggers({
           orgId,
           companionId,
           database,
@@ -2311,7 +2298,7 @@ export function registerCompanionRoutes(
             database,
           });
         }
-        await deleteCompanionTriggerV2({ orgId, companionId, triggerId, database });
+        await deleteCompanionTrigger({ orgId, companionId, triggerId, database });
       });
       return c.body(null, 204);
     } catch (error) {
@@ -2324,13 +2311,13 @@ export function registerCompanionRoutes(
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const triggerId = companionIdSchema.parse(c.req.param("triggerId"));
       const trigger = await tenant(c, async ({ orgId, database }) => {
-        const current = (await listCompanionTriggersV2({
+        const current = (await listCompanionTriggers({
           orgId, companionId, database, webhookBaseUrl: companionWebhookBaseUrl(env),
         })).find((candidate) => candidate.id === triggerId);
         if (current) {
           await unregisterCompanionTriggerIfWired({ orgId, companionId, trigger: current, database });
         }
-        const rotated = await rotateCompanionTriggerSecretV2({
+        const rotated = await rotateCompanionTriggerSecret({
           orgId,
           companionId,
           triggerId,
@@ -2350,7 +2337,7 @@ export function registerCompanionRoutes(
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const triggerId = companionIdSchema.parse(c.req.param("triggerId"));
       const trigger = await tenant(c, async ({ orgId, database }) => {
-        const current = (await listCompanionTriggersV2({
+        const current = (await listCompanionTriggers({
           orgId, companionId, database, webhookBaseUrl: companionWebhookBaseUrl(env),
         })).find((candidate) => candidate.id === triggerId);
         if (!current) throw new CompanionTriggerNotFoundError();
@@ -2367,7 +2354,7 @@ export function registerCompanionRoutes(
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const triggerId = companionIdSchema.parse(c.req.param("triggerId"));
       await tenant(c, ({ orgId, database }) =>
-        unregisterCompanionTriggerWebhookV2({
+        unregisterCompanionTriggerWebhook({
           orgId,
           companionId,
           triggerId,
@@ -2384,19 +2371,18 @@ export function registerCompanionRoutes(
   app.delete("/v1/companions/:id", async (c) => {
     try {
       const companionId = companionIdSchema.parse(c.req.param("id"));
-      const requestId = companionOperationRequestIdSchema.parse(
-        c.req.header(COMPANION_OPERATION_IDEMPOTENCY_HEADER),
+      const requestId = companionLifecycleRequestIdSchema.parse(
+        c.req.header(COMPANION_LIFECYCLE_IDEMPOTENCY_HEADER),
       );
       const accepted = await tenant(c, ({ orgId, database }) =>
-        enqueueCompanionOperationV2({
+        desireCompanionLifecycleV3({
           orgId,
           companionId,
           requestId,
-          kind: "delete",
-          clientSurface: "web",
+          intent: "delete",
           database,
         }));
-      return c.json({ operation: accepted.operation }, 202);
+      return c.json({ lifecycle: accepted }, 202);
     } catch (error) {
       return routeError(c, error);
     }
@@ -2407,7 +2393,7 @@ export function registerCompanionRoutes(
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const body = setCompanionProviderInputSchema.parse(await c.req.json());
       const companion = await tenant(c, ({ actor, orgId, database }) =>
-        setCompanionProviderV2({
+        setCompanionProvider({
           actor,
           orgId,
           companionId,
@@ -2436,7 +2422,7 @@ export function registerCompanionRoutes(
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const body = setCompanionWorkspaceShareInputSchema.parse(await c.req.json());
       const shares = await tenant(c, ({ actor, orgId, database }) =>
-        setCompanionWorkspaceShareV2({ actor, orgId, companionId, role: body.role, database }));
+        setCompanionWorkspaceShare({ actor, orgId, companionId, role: body.role, database }));
       return c.json({ shares });
     } catch (error) {
       return routeError(c, error);
@@ -2447,7 +2433,7 @@ export function registerCompanionRoutes(
     try {
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const thread = await tenant(c, ({ actor, orgId, database }) =>
-        readCompanionThreadV2({ actor, orgId, companionId, database }));
+        readCompanionThread({ actor, orgId, companionId, database }));
       c.header("Cache-Control", "private, no-store");
       return c.json({ thread: projectThreadForHttp(thread, transcriptionAvailable) });
     } catch (error) {
@@ -2473,7 +2459,7 @@ export function registerCompanionRoutes(
             })
           : null;
         return projectThreadWindowForHttp(
-          await readCompanionThreadWindowV2({
+          await readCompanionThreadWindow({
             actor,
             orgId,
             companionId,
@@ -2511,7 +2497,7 @@ export function registerCompanionRoutes(
             companionId,
           });
           if (sequence !== null) {
-            const incremental = await readCompanionThreadChangesV2({
+            const incremental = await readCompanionThreadChanges({
               actor,
               orgId,
               companionId,
@@ -2529,13 +2515,13 @@ export function registerCompanionRoutes(
 
           // A v1 cursor receives exactly one legacy comparison. Capture the new sequence first:
           // writes racing the full projection are therefore picked up by the next v2 delta.
-          const baseline = await readCompanionThreadProjectionSequenceV2({
+          const baseline = await readCompanionThreadProjectionSequence({
             actor,
             orgId,
             companionId,
             database,
           });
-          const thread = await syncCompanionThreadV2({ actor, orgId, companionId, database });
+          const thread = await syncCompanionThread({ actor, orgId, companionId, database });
           const legacy = buildCompanionThreadDelta({
             orgId,
             actorId: actor.id,
@@ -2554,7 +2540,7 @@ export function registerCompanionRoutes(
             has_more: false,
           });
         }
-        const thread = await syncCompanionThreadV2({ actor, orgId, companionId, database });
+        const thread = await syncCompanionThread({ actor, orgId, companionId, database });
         return buildCompanionThreadDelta({
           orgId,
           actorId: actor.id,
@@ -2588,7 +2574,7 @@ export function registerCompanionRoutes(
         if ((c.req.header("content-type") ?? "").includes("multipart/form-data")) {
           const companionId = companionIdSchema.parse(c.req.param("id"));
           const companion = await tenant(c, ({ actor, orgId, database }) =>
-            getCompanionV2({ actor, orgId, companionId, database }));
+            getCompanionRuntimeView({ actor, orgId, companionId, database }));
           if (companion.access === "viewer") throw new CompanionRuntimeForbiddenError();
         }
       } catch (error) {
@@ -2754,7 +2740,7 @@ export function registerCompanionRoutes(
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const attachmentId = companionIdSchema.parse(c.req.param("attachmentId"));
       const asset = await tenant(c, ({ actor, orgId, database }) =>
-        readCompanionAttachmentV2({ actor, orgId, companionId, attachmentId, database }));
+        readCompanionAttachment({ actor, orgId, companionId, attachmentId, database }));
       if (asset.availability === "expired" || asset.storageKey === null) {
         c.header("Cache-Control", "private, no-store");
         return c.json({ ok: false, error: "attachment expired" }, 410);
@@ -2885,11 +2871,11 @@ export function registerCompanionRoutes(
             });
           }
           return projectThreadForHttp(
-            await readCompanionThreadV2({ actor, orgId, companionId, database }),
+            await readCompanionThread({ actor, orgId, companionId, database }),
             transcriptionAvailable,
           );
         }
-        const pending = await getCompanionDecisionV2({
+        const pending = await getCompanionDecision({
           orgId,
           companionId,
           requestId,
@@ -2903,7 +2889,7 @@ export function registerCompanionRoutes(
           && ["denied", "expired", "cancelled"].includes(pending.decisionStatus)
         ) {
           return projectThreadForHttp(
-            await readCompanionThreadV2({ actor, orgId, companionId, database }),
+            await readCompanionThread({ actor, orgId, companionId, database }),
             transcriptionAvailable,
           );
         }
@@ -2916,7 +2902,7 @@ export function registerCompanionRoutes(
             && pending.proposal?.kind === "config"
             && pending.proposal.model_id
           ) {
-            const companion = await getCompanionV2({ actor, orgId, companionId, database });
+            const companion = await getCompanionRuntimeView({ actor, orgId, companionId, database });
             const providerId = companion.runtime.provider_ids[0];
             const modelId = providerId
               ? companionCatalogModel(
@@ -2933,7 +2919,7 @@ export function registerCompanionRoutes(
               );
             }
           }
-          await answerCompanionConfigDecisionV2({
+          await answerCompanionConfigDecision({
             orgId,
             companionId,
             requestId,
@@ -2945,7 +2931,7 @@ export function registerCompanionRoutes(
             throw new Error("Companion routine proposals cannot be answered with free text");
           }
           proposalDecisionMutation = "routine";
-          await answerCompanionRoutineDecisionV2({
+          await answerCompanionRoutineDecision({
             orgId,
             companionId,
             requestId,
@@ -2957,7 +2943,7 @@ export function registerCompanionRoutes(
             throw new Error("Companion trigger proposals cannot be answered with free text");
           }
           proposalDecisionMutation = "trigger";
-          const decisionResult = await answerCompanionTriggerDecisionV2({
+          const decisionResult = await answerCompanionTriggerDecision({
             orgId,
             companionId,
             requestId,
@@ -2966,7 +2952,7 @@ export function registerCompanionRoutes(
           });
           const triggerId = triggerIdFromDecisionResult(decisionResult);
           if (body.action === "allow" && triggerId) {
-            const created = (await listCompanionTriggersV2({
+            const created = (await listCompanionTriggers({
               orgId,
               companionId,
               database,
@@ -2977,7 +2963,7 @@ export function registerCompanionRoutes(
             }
           }
         } else {
-          await answerCompanionDecisionV2({
+          await answerCompanionDecision({
             orgId,
             companionId,
             requestId,
@@ -2987,7 +2973,7 @@ export function registerCompanionRoutes(
           });
         }
         return projectThreadForHttp(
-          await readCompanionThreadV2({ actor, orgId, companionId, database }),
+          await readCompanionThread({ actor, orgId, companionId, database }),
           transcriptionAvailable,
         );
       });
@@ -3004,33 +2990,14 @@ export function registerCompanionRoutes(
     }
   });
 
-  app.post("/v1/companions/:id/turns/:turnId/retry", async (c) => {
-    try {
-      const companionId = companionIdSchema.parse(c.req.param("id"));
-      const turnId = companionIdSchema.parse(c.req.param("turnId"));
-      const body = retryCompanionTurnInputSchema.parse(await c.req.json());
-      const accepted = await tenant(c, ({ orgId, database }) => retryCompanionTurnV2({
-        orgId,
-        companionId,
-        turnId,
-        retryId: body.retry_id,
-        clientSurface: "web",
-        database,
-      }));
-      return c.json({ operation: accepted.operation }, 202);
-    } catch (error) {
-      return routeError(c, error);
-    }
-  });
-
   app.post("/v1/companions/:id/turns/:turnId/cancel", async (c) => {
     try {
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const turnId = companionIdSchema.parse(c.req.param("turnId"));
       cancelCompanionTurnInputSchema.parse(await c.req.json().catch(() => ({})));
       const accepted = await tenant(c, async ({ actor, orgId, database }) => {
-        const turn = await cancelCompanionTurnV2({ orgId, companionId, turnId, database });
-        const thread = await readCompanionThreadV2({ actor, orgId, companionId, database });
+        const turn = await cancelCompanionTurn({ orgId, companionId, turnId, database });
+        const thread = await readCompanionThread({ actor, orgId, companionId, database });
         return { turn, thread: projectThreadForHttp(thread, transcriptionAvailable) };
       });
       return c.json(accepted, 202);
@@ -3043,40 +3010,9 @@ export function registerCompanionRoutes(
     try {
       const companionId = companionIdSchema.parse(c.req.param("id"));
       const companion = await tenant(c, ({ actor, orgId, database }) =>
-        getCompanionV2({ actor, orgId, companionId, withLastMessage: true, database }));
+        getCompanionRuntimeView({ actor, orgId, companionId, withLastMessage: true, database }));
       c.header("Cache-Control", "private, no-store");
       return c.json({ companion });
-    } catch (error) {
-      return routeError(c, error);
-    }
-  });
-
-  async function enqueueLifecycle(
-    c: Context<{ Variables: ApiVariables }>,
-    companionId: string,
-    requestId: string,
-    kind: "start" | "stop" | "restart_pi" | "restart_box",
-    clientSurface: "web" | "mobile_web" | "native_mobile" = "web",
-  ) {
-    return tenant(c, ({ orgId, database }) => enqueueCompanionOperationV2({
-      orgId,
-      companionId,
-      requestId,
-      kind,
-      clientSurface,
-      database,
-    }));
-  }
-
-  app.post("/v1/companions/:id/runtime/start", async (c) => {
-    try {
-      const companionId = companionIdSchema.parse(c.req.param("id"));
-      const body = startCompanionRuntimeInputSchema.parse(await c.req.json().catch(() => ({})));
-      const requestId = companionOperationRequestIdSchema.parse(
-        c.req.header(COMPANION_OPERATION_IDEMPOTENCY_HEADER),
-      );
-      const accepted = await enqueueLifecycle(c, companionId, requestId, "start", body.client_surface);
-      return c.json({ operation: accepted.operation }, 202);
     } catch (error) {
       return routeError(c, error);
     }
@@ -3086,29 +3022,36 @@ export function registerCompanionRoutes(
     try {
       const companionId = companionIdSchema.parse(c.req.param("id"));
       restartCompanionRuntimeInputSchema.parse(await c.req.json());
-      const requestId = companionOperationRequestIdSchema.parse(
-        c.req.header(COMPANION_OPERATION_IDEMPOTENCY_HEADER),
+      const requestId = companionLifecycleRequestIdSchema.parse(
+        c.req.header(COMPANION_LIFECYCLE_IDEMPOTENCY_HEADER),
       );
-      const accepted = await enqueueLifecycle(
-        c,
+      const accepted = await tenant(c, ({ orgId, database }) => desireCompanionLifecycleV3({
+        orgId,
         companionId,
         requestId,
-        "restart_pi",
-      );
-      return c.json({ operation: accepted.operation }, 202);
+        intent: "recycle_pi",
+        database,
+      }));
+      return c.json({ lifecycle: accepted }, 202);
     } catch (error) {
       return routeError(c, error);
     }
   });
 
-  app.post("/v1/companions/:id/runtime/stop", async (c) => {
+  app.post("/v1/companions/:id/runtime/archive", async (c) => {
     try {
       const companionId = companionIdSchema.parse(c.req.param("id"));
-      const requestId = companionOperationRequestIdSchema.parse(
-        c.req.header(COMPANION_OPERATION_IDEMPOTENCY_HEADER),
+      const requestId = companionLifecycleRequestIdSchema.parse(
+        c.req.header(COMPANION_LIFECYCLE_IDEMPOTENCY_HEADER),
       );
-      const accepted = await enqueueLifecycle(c, companionId, requestId, "stop");
-      return c.json({ operation: accepted.operation }, 202);
+      const accepted = await tenant(c, ({ orgId, database }) => desireCompanionLifecycleV3({
+        orgId,
+        companionId,
+        requestId,
+        intent: "archive",
+        database,
+      }));
+      return c.json({ lifecycle: accepted }, 202);
     } catch (error) {
       return routeError(c, error);
     }
@@ -3120,7 +3063,7 @@ export function registerCompanionRoutes(
       const resolved = await tenant(c, async ({ actor, orgId, database }) => ({
         actor,
         orgId,
-        companion: await getCompanionV2({ actor, orgId, companionId, database }),
+        companion: await getCompanionRuntimeView({ actor, orgId, companionId, database }),
       }));
       if (resolved.companion.access === "viewer") throw new CompanionRuntimeForbiddenError();
       const desktop = await mintCompanionDesktop({
