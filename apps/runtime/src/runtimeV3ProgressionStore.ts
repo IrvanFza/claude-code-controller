@@ -1,8 +1,10 @@
+import {
+  decodeRuntimeV3PreparationSnapshot,
+} from "@companion/companion-runtime";
 import type {
   RuntimeV3ConvergencePersistence,
   RuntimeV3DurableOutcome,
   RuntimeV3PreparationPersistence,
-  RuntimeV3ProviderMaterial,
   RuntimeV3Turn,
   RuntimeV3WarmTurnPersistence,
 } from "@companion/companion-runtime/v3/internal";
@@ -161,13 +163,23 @@ interface PreparationClaimRow {
   checkpoint: "pending" | "box_created" | "box_ready" | "staged";
   boxIdempotencyKey: string;
   boxId: string | null;
-  modelId: string;
-  persona: string | null;
-  providerMaterial: RuntimeV3ProviderMaterial[];
   claimToken: string;
   claimEpoch: string;
   gateEpoch: string;
   createdAt: Date;
+  authorized: boolean;
+  actorId: string | null;
+  modelId: string | null;
+  persona: string | null;
+  settingsRevision: string | null;
+  skillsRevision: number | null;
+  providerRefs: unknown;
+  skillRefs: unknown;
+  mcpRefs: unknown;
+  providerMaterial: unknown;
+  skillMaterial: unknown;
+  mcpMaterial: unknown;
+  configCatalog: unknown;
 }
 
 /** Runtime-only preparation facts. Box identity crosses this seam only after a fenced checkpoint. */
@@ -180,14 +192,28 @@ export function createRuntimeV3PostgresPreparationPersistence(
         select org_id as "orgId", companion_id as "companionId", turn_id as "turnId",
           command_id as "commandId", checkpoint, box_idempotency_key as "boxIdempotencyKey",
           box_id as "boxId", claim_token as "claimToken", claim_epoch::text as "claimEpoch",
-          gate_epoch::text as "gateEpoch", model_id as "modelId", persona,
-          provider_material as "providerMaterial", created_at as "createdAt"
+          gate_epoch::text as "gateEpoch", created_at as "createdAt",
+          authorized, actor_id as "actorId", model_id as "modelId", persona,
+          settings_revision::text as "settingsRevision", skills_revision as "skillsRevision",
+          provider_refs as "providerRefs", skill_refs as "skillRefs", mcp_refs as "mcpRefs",
+          provider_material as "providerMaterial", skill_material as "skillMaterial",
+          mcp_material as "mcpMaterial", config_catalog as "configCatalog"
         from public.companion_v3_runtime_claim_preparation(
-          ${executorId}, ${PREPARATION_LEASE_SECONDS}, 3
+          ${executorId}, ${PREPARATION_LEASE_SECONDS}, 4
         )
       `;
       const row = rows[0];
+      const material = row ? decodeRuntimeV3PreparationSnapshot({
+        provider_refs: row.providerRefs,
+        skill_refs: row.skillRefs,
+        mcp_refs: row.mcpRefs,
+        provider_material: row.providerMaterial,
+        skill_material: row.skillMaterial,
+        mcp_material: row.mcpMaterial,
+        config_catalog: row.configCatalog,
+      }) : null;
       return row ? {
+        executorId,
         orgId: row.orgId,
         companionId: row.companionId,
         turnId: row.turnId,
@@ -195,10 +221,20 @@ export function createRuntimeV3PostgresPreparationPersistence(
         checkpoint: row.checkpoint,
         boxIdempotencyKey: row.boxIdempotencyKey,
         boxId: row.boxId,
+        createdAt: row.createdAt,
+        authorized: row.authorized,
+        actorId: row.actorId,
         modelId: row.modelId,
         persona: row.persona,
-        providerMaterial: row.providerMaterial,
-        createdAt: row.createdAt,
+        settingsRevision: row.settingsRevision === null ? null : BigInt(row.settingsRevision),
+        skillsRevision: row.skillsRevision,
+        providerRefs: material?.providerRefs ?? [],
+        skillRefs: material?.skillRefs ?? [],
+        mcpRefs: material?.mcpRefs ?? [],
+        providerMaterial: material?.providerMaterial ?? [],
+        skillMaterial: material?.skillMaterial ?? [],
+        mcpMaterial: material?.mcpMaterial ?? [],
+        configCatalog: material?.configCatalog ?? null,
         fence: {
           token: row.claimToken,
           epoch: BigInt(row.claimEpoch),
@@ -212,7 +248,11 @@ export function createRuntimeV3PostgresPreparationPersistence(
           ${claim.orgId}::uuid, ${claim.companionId}::uuid,
           ${claim.fence.token}::uuid, ${claim.fence.epoch.toString()}::bigint,
           ${claim.fence.gateEpoch.toString()}::bigint, ${claim.checkpoint}, ${input.next},
-          ${input.boxId ?? null}, ${input.piInvocationId ?? null}, 3
+          ${input.boxId ?? null}, ${input.piInvocationId ?? null},
+          ${input.diskLayoutVersion ?? null},
+          ${input.appliedSettingsRevision?.toString() ?? null}::bigint,
+          ${input.appliedSkillsRevision ?? null}, ${input.skillsDigest ?? null},
+          ${input.materialExpiresAt ?? null}, 4
         ) as checkpointed
       `;
       return rows[0]?.checkpointed === true;
@@ -223,10 +263,39 @@ export function createRuntimeV3PostgresPreparationPersistence(
           ${claim.orgId}::uuid, ${claim.companionId}::uuid,
           ${claim.fence.token}::uuid, ${claim.fence.epoch.toString()}::bigint,
           ${claim.fence.gateEpoch.toString()}::bigint, ${input.delaySeconds},
-          ${input.error?.code ?? null}, ${input.error?.message ?? null}, 3
+          ${input.error?.code ?? null}, ${input.error?.message ?? null}, 4
         ) as deferred
       `;
       return rows[0]?.deferred === true;
+    },
+    async reauthorize(claim) {
+      const rows = await sql<Array<{ authorized: boolean }>>`
+        select public.companion_v3_runtime_reauthorize_preparation(
+          ${claim.orgId}::uuid, ${claim.companionId}::uuid,
+          ${claim.fence.token}::uuid, ${claim.fence.epoch.toString()}::bigint,
+          ${claim.fence.gateEpoch.toString()}::bigint, ${claim.executorId},
+          ${PREPARATION_LEASE_SECONDS}, 4
+        ) as authorized
+      `;
+      return rows[0]?.authorized === true;
+    },
+    async mintCredentials(claim) {
+      const rows = await sql<Array<{
+        hubToken: string;
+        mcpBrokerToken: string | null;
+        controlToken: string;
+        expiresAt: Date;
+      }>>`
+        select hub_token as "hubToken", mcp_broker_token as "mcpBrokerToken",
+          control_token as "controlToken", expires_at as "expiresAt"
+        from public.companion_v3_runtime_mint_preparation_credentials(
+          ${claim.orgId}::uuid, ${claim.companionId}::uuid,
+          ${claim.fence.token}::uuid, ${claim.fence.epoch.toString()}::bigint,
+          ${claim.fence.gateEpoch.toString()}::bigint, ${claim.executorId},
+          ${PREPARATION_LEASE_SECONDS}, 4
+        )
+      `;
+      return rows[0] ?? null;
     },
   };
 }

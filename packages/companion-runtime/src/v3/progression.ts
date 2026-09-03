@@ -1,6 +1,23 @@
 import { safeRuntimeError } from "../errors";
 import { classifyPiJournalPage, type ValidatedPiJournalRead } from "../piEvents";
-import type { ErrorAction, SafeRuntimeError } from "../types";
+import { COMPANION_BUDGETS } from "@companion/contracts";
+import type {
+  ErrorAction,
+  ProviderRef,
+  RuntimeConfigCatalog,
+  SafeRuntimeError,
+  SkillRef,
+  RuntimeV3McpMaterial,
+  RuntimeV3McpRef,
+  RuntimeV3ProviderMaterial,
+  RuntimeV3SkillMaterial,
+} from "../types";
+export type {
+  RuntimeV3McpMaterial,
+  RuntimeV3McpRef,
+  RuntimeV3ProviderMaterial,
+  RuntimeV3SkillMaterial,
+} from "../types";
 import type { RuntimeBoxControl, RuntimePiControl } from "../ports";
 
 export const RUNTIME_V3_LANES = ["main", "background"] as const;
@@ -126,21 +143,8 @@ export type RuntimeV3Convergence = Pick<RuntimeV3Progression, "converge">;
 export type RuntimeV3PreparationCheckpoint =
   | "pending" | "box_created" | "box_ready" | "staged";
 
-export type RuntimeV3ProviderMaterial = {
-  provider_id: string;
-  auth_method: string;
-  credential_generation: string;
-  credential_version: number;
-  ciphertext: string;
-  iv: string;
-  auth_tag: string;
-  wrapped_dek: string;
-  wrap_iv: string;
-  wrap_auth_tag: string;
-  key_id: string;
-};
-
 export interface RuntimeV3PreparationClaim {
+  executorId: string;
   orgId: string;
   companionId: string;
   turnId: string | null;
@@ -148,11 +152,36 @@ export interface RuntimeV3PreparationClaim {
   checkpoint: RuntimeV3PreparationCheckpoint;
   boxIdempotencyKey: string;
   boxId: string | null;
-  modelId: string;
-  persona: string | null;
-  providerMaterial: RuntimeV3ProviderMaterial[];
   createdAt: Date;
+  authorized: boolean;
+  actorId: string | null;
+  modelId: string | null;
+  persona: string | null;
+  settingsRevision: bigint | null;
+  skillsRevision: number | null;
+  providerRefs: ProviderRef[];
+  skillRefs: SkillRef[];
+  mcpRefs: RuntimeV3McpRef[];
+  providerMaterial: RuntimeV3ProviderMaterial[];
+  skillMaterial: RuntimeV3SkillMaterial[];
+  mcpMaterial: RuntimeV3McpMaterial[];
+  configCatalog: RuntimeConfigCatalog | null;
   fence: RuntimeV3Fence;
+}
+
+export interface RuntimeV3PreparationCredentials {
+  hubToken: string;
+  mcpBrokerToken: string | null;
+  controlToken: string;
+  expiresAt: Date;
+}
+
+export interface RuntimeV3PreparedMaterial {
+  diskLayoutVersion: number;
+  appliedSettingsRevision: bigint;
+  appliedSkillsRevision: number;
+  skillsDigest: string;
+  materialExpiresAt: Date;
 }
 
 export interface RuntimeV3PreparationPersistence {
@@ -163,28 +192,35 @@ export interface RuntimeV3PreparationPersistence {
       next: "box_created" | "box_ready" | "staged" | "prepared";
       boxId?: string;
       piInvocationId?: string;
+      diskLayoutVersion?: number;
+      appliedSettingsRevision?: bigint;
+      appliedSkillsRevision?: number;
+      skillsDigest?: string;
+      materialExpiresAt?: Date;
     },
   ): Promise<boolean>;
   defer(
     claim: RuntimeV3PreparationClaim,
     input: { delaySeconds: number; error: SafeRuntimeError | null },
   ): Promise<boolean>;
+  reauthorize(claim: RuntimeV3PreparationClaim): Promise<boolean>;
+  mintCredentials(
+    claim: RuntimeV3PreparationClaim,
+  ): Promise<RuntimeV3PreparationCredentials | null>;
+}
+
+export interface RuntimeV3PreparationStager {
+  stagePreparation(input: {
+    claim: RuntimeV3PreparationClaim;
+    authorize: () => Promise<RuntimeV3PreparationCredentials | null>;
+    signal: AbortSignal;
+  }): Promise<RuntimeV3PreparedMaterial>;
 }
 
 export interface RuntimeV3PreparationOptions {
   persistence: RuntimeV3PreparationPersistence;
   box: Pick<RuntimeBoxControl, "createGenerationBox" | "applyGenerationBoxSettings" | "getStatus">;
-  resourceStager: {
-    stagePreparation(input: {
-      orgId: string;
-      companionId: string;
-      boxId: string;
-      modelId: string;
-      persona: string | null;
-      providerMaterial: RuntimeV3ProviderMaterial[];
-      signal: AbortSignal;
-    }): Promise<void>;
-  };
+  preparationStager: RuntimeV3PreparationStager;
   pi: Pick<RuntimePiControl, "startPiDaemon">;
   observePreparedLatency?: (durationMs: number) => void;
   now?: () => Date;
@@ -465,6 +501,15 @@ async function defaultWarmPollWait(): Promise<void> {
 const PREPARATION_RETRY_SECONDS = 5;
 const PREPARATION_POLL_SECONDS = 1;
 const PREPARATION_BOX_TTL_SECONDS = 6 * 60 * 60;
+export const RUNTIME_V3_PREPARATION_BUDGET_MS = COMPANION_BUDGETS.layoutInstallBudgetMs;
+export const RUNTIME_V3_STAGING_BUDGET_MS =
+  RUNTIME_V3_PREPARATION_BUDGET_MS - COMPANION_BUDGETS.boxRequestTimeoutMs;
+export const RUNTIME_V3_PI_ACTIVATION_BUDGET_MS = COMPANION_BUDGETS.boxRequestTimeoutMs;
+
+if (
+  RUNTIME_V3_STAGING_BUDGET_MS >= RUNTIME_V3_PREPARATION_BUDGET_MS
+  || RUNTIME_V3_PI_ACTIVATION_BUDGET_MS >= RUNTIME_V3_PREPARATION_BUDGET_MS
+) throw new Error("Runtime v3 nested preparation budgets require a strict margin");
 
 /** Prepare one cold Companion through fenced, restart-safe checkpoints. */
 export function createRuntimeV3Preparation(
@@ -477,9 +522,13 @@ export function createRuntimeV3Preparation(
       while (progressed < LANE_CONVERGENCE_LIMIT) {
         const claim = await options.persistence.claim({ executorId });
         if (!claim) return { progressed, exhausted: false };
-        const signal = AbortSignal.timeout(60_000);
+        const signal = AbortSignal.timeout(RUNTIME_V3_PREPARATION_BUDGET_MS);
         try {
+          if (!claim.authorized) throw new Error("Runtime v3 preparation is not authorized");
           if (claim.checkpoint === "pending") {
+            if (!await options.persistence.reauthorize(claim)) {
+              throw new Error("Runtime v3 preparation authorization changed");
+            }
             const created = await options.box.createGenerationBox({
               companionId: claim.companionId,
               generation: 1n,
@@ -488,6 +537,9 @@ export function createRuntimeV3Preparation(
               // Preparation owns no user-facing operation deadline. The signal bounds the whole
               // claim, while this bound lets an unknown-snapshot fallback take a fresh create slot.
               workDeadlineAt: new Date(now().getTime() + 60_000),
+              // A preparation claim never waits for an image build. It may consume a ready image,
+              // while the next fenced claim retries after the normal preparation backoff.
+              deadlineAt: now(),
               signal,
             });
             if (!await options.persistence.checkpoint(claim, {
@@ -496,6 +548,9 @@ export function createRuntimeV3Preparation(
             })) return { progressed, exhausted: false };
           } else if (claim.checkpoint === "box_created") {
             if (!claim.boxId) throw new Error("Box identity is missing after creation");
+            if (!await options.persistence.reauthorize(claim)) {
+              throw new Error("Runtime v3 preparation authorization changed");
+            }
             await options.box.applyGenerationBoxSettings({
               boxId: claim.boxId,
               companionId: claim.companionId,
@@ -521,21 +576,36 @@ export function createRuntimeV3Preparation(
             }
           } else if (claim.checkpoint === "box_ready") {
             if (!claim.boxId) throw new Error("Box identity is missing before staging");
-            await options.resourceStager.stagePreparation({
-              orgId: claim.orgId,
-              companionId: claim.companionId,
-              boxId: claim.boxId,
-              modelId: claim.modelId,
-              persona: claim.persona,
-              providerMaterial: claim.providerMaterial,
-              signal,
+            const staged = await options.preparationStager.stagePreparation({
+              claim,
+              authorize: async () => await options.persistence.mintCredentials(claim),
+              signal: AbortSignal.any([
+                signal,
+                AbortSignal.timeout(RUNTIME_V3_STAGING_BUDGET_MS),
+              ]),
             });
-            if (!await options.persistence.checkpoint(claim, { next: "staged" })) {
+            if (!await options.persistence.checkpoint(claim, {
+              next: "staged",
+              diskLayoutVersion: staged.diskLayoutVersion,
+              appliedSettingsRevision: staged.appliedSettingsRevision,
+              appliedSkillsRevision: staged.appliedSkillsRevision,
+              skillsDigest: staged.skillsDigest,
+              materialExpiresAt: staged.materialExpiresAt,
+            })) {
               return { progressed, exhausted: false };
             }
           } else {
             if (!claim.boxId) throw new Error("Box identity is missing before Pi activation");
-            const pi = await options.pi.startPiDaemon({ boxId: claim.boxId, signal });
+            if (!await options.persistence.reauthorize(claim)) {
+              throw new Error("Runtime v3 preparation authorization changed");
+            }
+            const pi = await options.pi.startPiDaemon({
+              boxId: claim.boxId,
+              signal: AbortSignal.any([
+                signal,
+                AbortSignal.timeout(RUNTIME_V3_PI_ACTIVATION_BUDGET_MS),
+              ]),
+            });
             if (pi.state !== "idle") throw new Error("Pi did not become idle during preparation");
             if (!await options.persistence.checkpoint(claim, {
               next: "prepared",
