@@ -491,7 +491,13 @@ merge step, or filesystem lock. A
 The runtime instance and the run-scoped broker intentionally have different Pi invocation
 identities. A background Turn pins its broker identity with the dispatch write intent and uses that
 Turn-bound value for event reads, projection, terminal acknowledgement, and cancellation. The
-main-instance identity remains reserved for ordinary Companion broker operations.
+main-instance identity remains reserved for ordinary Companion broker operations. When a start is
+proven rejected and its exact invocation is terminated, a dedicated durable generation derives the
+next invocation identity; ordinary retries and takeovers keep their current identity, the Box keeps
+the old cancellation tombstone, and no ambiguous prompt is replayed.
+Trigger output validation is post-admission, so unsupported output fails that occurrence after exact
+cleanup instead of creating a new identity for an already-accepted prompt. Later webhook events are
+independent and the trigger stays enabled.
 
 That run-scoped Pi receives one routine-only terminal tool. Its first accepted call is the run's
 return value and immediately shuts down that Pi process. `notify` commits one visible Companion
