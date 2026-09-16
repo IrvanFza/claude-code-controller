@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS portable_skill_bundles (id uuid PRIMARY KEY,source_owner_id text NOT NULL,source_companion_id uuid NOT NULL,manifest_version integer NOT NULL CHECK(manifest_version=1),bundle_hash text NOT NULL CHECK(bundle_hash ~ '^[0-9a-f]{64}$'),object_sha256 text NOT NULL CHECK(object_sha256 ~ '^[0-9a-f]{64}$'),byte_size integer NOT NULL CHECK(byte_size BETWEEN 25 AND 15000000),storage_key text NOT NULL UNIQUE,created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS portable_skill_exports (id uuid PRIMARY KEY,delivery_id uuid NOT NULL REFERENCES companion_deliveries(id) ON DELETE CASCADE,source_owner_id text NOT NULL,source_companion_id uuid NOT NULL,target_kind text NOT NULL DEFAULT 'delivery_main' CHECK(target_kind='delivery_main'),status text NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ready','error')),bundle_id uuid REFERENCES portable_skill_bundles(id),error text,created_at timestamptz NOT NULL DEFAULT now(),finished_at timestamptz);
+CREATE UNIQUE INDEX IF NOT EXISTS portable_export_delivery_main_uq ON portable_skill_exports(delivery_id);
+CREATE INDEX IF NOT EXISTS portable_export_pending_idx ON portable_skill_exports(status,created_at) WHERE status='pending';
+ALTER TABLE companion_deliveries ADD COLUMN IF NOT EXISTS include_skills boolean NOT NULL DEFAULT false;
+ALTER TABLE companion_deliveries ADD COLUMN IF NOT EXISTS skills_status text NOT NULL DEFAULT 'ready' CHECK(skills_status IN ('pending','ready','error'));
+ALTER TABLE companion_deliveries ADD COLUMN IF NOT EXISTS skills_error text;
+ALTER TABLE companions ADD COLUMN IF NOT EXISTS skill_bundle_id uuid REFERENCES portable_skill_bundles(id);
+ALTER TABLE companions ADD COLUMN IF NOT EXISTS skills_staged_hash text;
+ALTER TABLE companions ADD COLUMN IF NOT EXISTS skills_staged_box_id text;

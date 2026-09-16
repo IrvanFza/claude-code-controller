@@ -1,0 +1,52 @@
+{
+  "status": "passed",
+  "run": "15176f73aed3",
+  "seconds": 14.192,
+  "steps": [
+    {
+      "name": "database",
+      "exitCode": 0,
+      "seconds": 0.174
+    },
+    {
+      "name": "install",
+      "exitCode": 0,
+      "seconds": 0.126
+    },
+    {
+      "name": "web-install",
+      "exitCode": 0,
+      "seconds": 0.075
+    },
+    {
+      "name": "typecheck",
+      "exitCode": 0,
+      "seconds": 1.094
+    },
+    {
+      "name": "agent-unit",
+      "exitCode": 0,
+      "seconds": 0.294
+    },
+    {
+      "name": "agent-build",
+      "exitCode": 0,
+      "seconds": 0.237
+    },
+    {
+      "name": "system",
+      "exitCode": 0,
+      "seconds": 6.309
+    },
+    {
+      "name": "web-tests",
+      "exitCode": 0,
+      "seconds": 1.277
+    },
+    {
+      "name": "web-build",
+      "exitCode": 0,
+      "seconds": 1.956
+    }
+  ]
+}

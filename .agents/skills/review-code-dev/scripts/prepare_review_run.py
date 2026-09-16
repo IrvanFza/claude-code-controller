@@ -50,7 +50,8 @@ def detect_repo(cwd: Path) -> Path | None:
 
 def git_path(repo: Path, path: str) -> Path:
     result = run(["git", "rev-parse", "--git-path", path], repo)
-    return Path(require_ok(result).strip()).resolve()
+    resolved = Path(require_ok(result).strip())
+    return (resolved if resolved.is_absolute() else repo / resolved).resolve()
 
 
 def tracked_artifacts(repo: Path) -> list[str]:
@@ -62,6 +63,10 @@ def tracked_artifacts(repo: Path) -> list[str]:
 
 def ensure_local_exclude(repo: Path) -> dict[str, Any]:
     exclude_path = git_path(repo, "info/exclude")
+    probe = ARTIFACT_ROOT / ".review-code-dev-ignore-check"
+    if run(["git", "check-ignore", "-q", "--", probe.as_posix()], repo).returncode == 0:
+        return {"path": str(exclude_path), "added": False, "verified": True, "probe": probe.as_posix()}
+
     exclude_path.parent.mkdir(parents=True, exist_ok=True)
     before = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
 

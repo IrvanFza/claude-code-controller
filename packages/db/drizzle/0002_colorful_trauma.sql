@@ -1,1 +1,0 @@
-CREATE INDEX "skill_comments_org_idx" ON "skill_comments" USING btree ("org_id");

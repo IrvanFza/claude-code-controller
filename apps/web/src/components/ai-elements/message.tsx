@@ -1,0 +1,59 @@
+"use client";
+
+import { cn } from "@/lib/utils";
+import type { UIMessage } from "ai";
+import { memo, type HTMLAttributes } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+
+export type MessageProps = HTMLAttributes<HTMLDivElement> & {
+  from: UIMessage["role"];
+};
+
+export const Message = ({ className, from, ...props }: MessageProps) => (
+  <div
+    className={cn(
+      "group flex w-full max-w-[95%] flex-col gap-2",
+      from === "user" ? "is-user ml-auto justify-end" : "is-assistant",
+      className,
+    )}
+    {...props}
+  />
+);
+
+export type MessageContentProps = HTMLAttributes<HTMLDivElement>;
+
+export const MessageContent = ({ children, className, ...props }: MessageContentProps) => (
+  <div
+    className={cn(
+      "flex w-fit min-w-0 max-w-full flex-col gap-2 overflow-hidden text-sm",
+      "group-[.is-user]:ml-auto group-[.is-user]:rounded-lg group-[.is-user]:bg-secondary group-[.is-user]:px-4 group-[.is-user]:py-3 group-[.is-user]:text-foreground",
+      "group-[.is-assistant]:text-foreground",
+      className,
+    )}
+    {...props}
+  >
+    {children}
+  </div>
+);
+
+export type MessageResponseProps = Omit<HTMLAttributes<HTMLDivElement>, "children"> & {
+  children: string;
+};
+
+/** Markdown response renderer with the same public shape as AI Elements MessageResponse. */
+const markdownPlugins = [remarkGfm];
+const markdownComponents = {
+  a: ({ href, children }: React.ComponentProps<"a">) => <a href={href} target="_blank" rel="noreferrer">{children}</a>,
+  input: ({ checked, ...props }: React.ComponentProps<"input">) => <input {...props} checked={checked} readOnly />,
+};
+export const MessageResponse = memo(({ children, className, ...props }: MessageResponseProps) => (
+  <div className={cn("markdown-body", className)} {...props}>
+    <ReactMarkdown
+      remarkPlugins={markdownPlugins}
+      components={markdownComponents}
+    >
+      {children}
+    </ReactMarkdown>
+  </div>
+));

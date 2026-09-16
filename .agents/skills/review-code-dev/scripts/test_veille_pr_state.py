@@ -36,8 +36,8 @@ class LedgerTests(unittest.TestCase):
                 ledger.read_candidates = original
 
             args = argparse.Namespace(
-                state=str(state_path), repo="The-Vibe-Company/demo", number=2,
-                url="https://github.com/The-Vibe-Company/demo/pull/2", run_id="test",
+                state=str(state_path), repo="example/demo", number=2,
+                url="https://github.com/example/demo/pull/2", run_id="test",
             )
             self.assertTrue(ledger.cmd_claim(args)["claimed"])
             self.assertEqual("already_in_progress", ledger.cmd_claim(args)["reason"])

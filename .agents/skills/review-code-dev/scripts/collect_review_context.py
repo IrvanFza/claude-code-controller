@@ -88,6 +88,7 @@ def require_ok(result: dict[str, Any]) -> str:
 
 
 def truncate_text(text: str, max_bytes: int) -> dict[str, Any]:
+    text = redact_secret_text(text)
     raw = text.encode("utf-8", errors="replace")
     if len(raw) <= max_bytes:
         return {"text": text, "truncated": False, "byte_length": len(raw)}
@@ -330,13 +331,15 @@ def collect_uncommitted(
 
 def collect_base(repo: Path, base: str, max_diff_bytes: int) -> dict[str, Any]:
     diff_ref = resolve_diff_ref(repo, base)
+    merge_base = require_ok(git(["merge-base", diff_ref, "HEAD"], repo)).strip()
     return {
         "mode": "base",
         "base_branch": base,
         "diff_ref": diff_ref,
-        "changed_files": split_names(require_ok(git(["diff", "--name-only", diff_ref], repo))),
-        "diff_stat": require_ok(git(["diff", diff_ref, "--stat"], repo, timeout=120)),
-        "diff": truncate_text(require_ok(git(["diff", diff_ref], repo, timeout=120)), max_diff_bytes),
+        "merge_base": merge_base,
+        "changed_files": split_names(require_ok(git(["diff", "--name-only", merge_base], repo))),
+        "diff_stat": require_ok(git(["diff", merge_base, "--stat"], repo, timeout=120)),
+        "diff": truncate_text(require_ok(git(["diff", merge_base], repo, timeout=120)), max_diff_bytes),
     }
 
 
