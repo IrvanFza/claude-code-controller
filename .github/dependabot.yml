@@ -1,9 +1,9 @@
 version: 2
 updates:
   - package-ecosystem: bun
-    directories:
-      - /
-      - /apps/web
+    # Hosted Dependabot cannot parse apps/web/bun.lock version 2 yet.
+    # Keep the native lockfile intact; track the supported root lockfile separately.
+    directory: /
     schedule:
       interval: weekly
       day: monday

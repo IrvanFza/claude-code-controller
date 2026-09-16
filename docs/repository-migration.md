@@ -41,8 +41,15 @@ application uses Vite and is served by the Railway API. Preserve the old product
 The Verify workflow retains the destination's pinned Gitleaks history scan and redacted
 output. Existing audited historical fingerprints remain excluded, plus one synthetic
 access-token fixture from the imported skill validation tests. Dependabot continues weekly
-updates for GitHub Actions, uses the Bun ecosystem for the root and web lockfiles,
-and tracks the npm lockfile in `tools/dev`.
+updates for GitHub Actions, uses the Bun ecosystem for the root lockfile, and tracks
+the npm lockfile in `tools/dev`.
+
+The hosted Dependabot Bun updater currently rejects the web lockfile's version 2 format
+([upstream issue](https://github.com/dependabot/dependabot-core/issues/15897)). The initial
+post-migration updater run confirmed this incompatibility. Web dependency updates remain
+manual with the pinned Bun 1.4.2 until GitHub supports that format; keep the native lockfile
+and full web verification intact. Do not downgrade or regenerate it with an older Bun merely
+to make the updater pass. Re-enable `/apps/web` when the hosted updater supports version 2.
 
 ## Acceptance and rollback
 
