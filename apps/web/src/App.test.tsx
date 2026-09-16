@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 
@@ -57,7 +57,8 @@ describe("settings and return navigation", () => {
     const fetchMock = installApi(); render(<App/>);
     const composer = await screen.findByRole("textbox", { name: "Message Companion" });
     fireEvent.change(composer, { target: { value: "Keep this idea" } });
-    fireEvent.click(screen.getByRole("button", { name: "Settings for Ada" }));
+    fireEvent.click(screen.getByRole("button", { name: "Options for Ada" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Settings for Ada" }));
     expect(await screen.findByRole("heading", { name: "Ada settings" })).toBeInTheDocument();
     expect(window.location.pathname).toBe("/companions/ada/settings");
     fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Ada Research" } });
@@ -75,10 +76,14 @@ describe("settings and return navigation", () => {
     expect(await screen.findByRole("heading", { name: "Ada settings" })).toBeInTheDocument();
     expect(fetchMock.mock.calls.some(([path]) => String(path).includes("discussions"))).toBe(false);
   });
-  it("uses the logo for navigation without creating work", async () => {
-    const fetchMock = installApi(); render(<App/>);
+  it("keeps the rail logo a mark, not a control that moves you elsewhere", async () => {
+    const fetchMock = installApi(); const view = render(<App/>);
     await screen.findByRole("heading", { name: "Launch" });
-    fireEvent.click(screen.getByRole("button", { name: "Back to discussions" }));
+    const mark = view.container.querySelector(".discussion-wordmark")!;
+    expect(mark.tagName).not.toBe("BUTTON");
+    expect(within(mark as HTMLElement).queryByRole("button")).toBeNull();
+    fireEvent.click(mark);
+    expect(window.location.pathname).toBe("/discussions/discussion-1");
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
   });
 });
